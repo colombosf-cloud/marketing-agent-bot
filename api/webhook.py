@@ -570,7 +570,6 @@ class handler(BaseHTTPRequestHandler):
                 return
             state = read_state()
             state = process(text, state)
-            state = check_validar(state)
             save_state(state)
         except Exception as e:
             print(f'Error: {e}')
