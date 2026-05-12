@@ -452,11 +452,35 @@ def h_correct_validar(text, state):
     return state
 
 def h_copies(text, state):
-    prompt = f"""El usuario pidió copies para Meta Ads: "{text}"
+    client = detect_client(text)
+    client_name = client['name'] if client else 'Sin especificar'
 
-Generá 3 variantes de copy con ángulos distintos (beneficio, dolor, curiosidad).
-Devolvé SOLO JSON válido, sin explicaciones extra:
-{{"copies": [{{"variante": 1, "angulo": "beneficio", "headline": "...", "cuerpo": "...", "cta": "..."}}, {{"variante": 2, "angulo": "dolor", "headline": "...", "cuerpo": "...", "cta": "..."}}, {{"variante": 3, "angulo": "curiosidad", "headline": "...", "cuerpo": "...", "cta": "..."}}]}}"""
+    # Extract formato y medio from text, defaults to standard
+    t = text.lower()
+    if 'story' in t or 'historia' in t:
+        formatos = 'Story'
+    elif 'reel' in t:
+        formatos = 'Reel'
+    elif 'carrusel' in t:
+        formatos = 'Carrusel'
+    else:
+        formatos = 'Feed/Story/network/reel'
+    medio = 'FB/IG'
+
+    prompt = f"""Copies para Meta Ads. Solicitud: "{text}"
+Cliente: {client_name}
+
+Generá 3 variantes de copy (ángulos: beneficio, dolor/problema, curiosidad/pregunta).
+El copy de cada opción debe ser completo y listo para usar: headline + cuerpo + CTA, todo junto en un texto corrido.
+
+Devolvé SOLO JSON válido:
+{{
+  "tematica": "tema o producto específico mencionado (ej: Máster en IA Aplicada)",
+  "prompt_contexto": "1-2 frases del insight/ángulo general que guía los copies",
+  "opcion1": "Headline: ...\\nCuerpo: ...\\nCTA: ...",
+  "opcion2": "Headline: ...\\nCuerpo: ...\\nCTA: ...",
+  "opcion3": "Headline: ...\\nCuerpo: ...\\nCTA: ..."
+}}"""
 
     copies_data = None
     try:
@@ -467,38 +491,44 @@ Devolvé SOLO JSON válido, sin explicaciones extra:
     except Exception:
         pass
 
-    if not copies_data or 'copies' not in copies_data:
+    if not copies_data:
         tg_send(claude(f'Generá 3 copies para Meta Ads en español: "{text}". Incluí headline, cuerpo y CTA para cada variante.'))
         return state
 
-    copies = copies_data['copies']
+    tematica = copies_data.get('tematica', text[:60])
+    contexto = copies_data.get('prompt_contexto', '')
+    op1 = copies_data.get('opcion1', '')
+    op2 = copies_data.get('opcion2', '')
+    op3 = copies_data.get('opcion3', '')
 
-    # Telegram text version
-    lines = ['✍️ *Copies generados*\n']
-    for c in copies:
-        lines.append(
-            f'*Variante {c["variante"]} — {c.get("angulo", "")}:*\n'
-            f'*Headline:* {c.get("headline", "")}\n'
-            f'{c.get("cuerpo", "")}\n'
-            f'*CTA:* _{c.get("cta", "")}_\n'
-        )
-    lines.append('¿Usás alguna tal cual o querés ajustes?')
-    tg_send('\n'.join(lines))
+    # Telegram text
+    tg_send(
+        f'✍️ *Copies — {client_name} · {tematica}*\n\n'
+        f'*Opción 1:*\n{op1}\n\n'
+        f'*Opción 2:*\n{op2}\n\n'
+        f'*Opción 3:*\n{op3}\n\n'
+        f'¿Usás alguna tal cual o querés ajustes?'
+    )
 
-    # CSV file version
+    # CSV con las columnas exactas de la planilla de Stefania
     try:
+        fecha = datetime.utcnow().strftime('%d/%m/%Y')
         with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False,
                                          encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Variante', 'Ángulo', 'Headline', 'Cuerpo', 'CTA', 'Estado', 'Notas'])
-            for c in copies:
-                writer.writerow([
-                    c.get('variante', ''), c.get('angulo', ''),
-                    c.get('headline', ''), c.get('cuerpo', ''),
-                    c.get('cta', ''), '', ''
-                ])
+            writer.writerow([
+                'Fecha pedido', 'Diseñado', 'Formatos', 'Medio',
+                'Institución', 'Temática', 'Parte de algunos prompt',
+                'Opción 1', 'Opción 2', 'Opción 3'
+            ])
+            writer.writerow([
+                fecha, '', formatos, medio,
+                client_name, tematica, contexto,
+                op1, op2, op3
+            ])
             tmppath = f.name
-        tg_send_document(tmppath, 'copies.csv', '📎 Copies para revisar — abrí en Excel o Google Sheets')
+        tg_send_document(tmppath, f'copies_{client_name.lower().replace("/","_")}_{datetime.utcnow().strftime("%Y%m%d")}.csv',
+                         '📎 Listo para pegar en la planilla de Stefania')
         os.unlink(tmppath)
     except Exception as e:
         print(f'CSV error: {e}')
