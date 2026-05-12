@@ -74,6 +74,44 @@ def cu_post(path, data):
 def cu_put(path, data):
     return http_req(f'https://api.clickup.com/api/v2/{path}', 'PUT', data, {'Authorization': CLICKUP_TOKEN})
 
+def web_search(query):
+    """DuckDuckGo Instant Answers — no API key needed"""
+    try:
+        params = urllib.parse.urlencode({'q': query, 'format': 'json', 'no_html': '1', 'skip_disambig': '1'})
+        req = urllib.request.Request(
+            f'https://api.duckduckgo.com/?{params}',
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+        parts = []
+        if data.get('Abstract'):
+            parts.append(data['Abstract'])
+        for t in data.get('RelatedTopics', [])[:5]:
+            if isinstance(t, dict) and t.get('Text'):
+                parts.append(t['Text'])
+        return ' | '.join(parts)[:2500] if parts else ''
+    except Exception as e:
+        print(f'DDG error: {e}')
+        return ''
+
+def meta_ads_library(competitor, country='AR'):
+    """Busca anuncios activos de un competidor en Meta Ads Library"""
+    try:
+        params = urllib.parse.urlencode({
+            'search_terms': competitor,
+            'ad_reached_countries': country,
+            'ad_type': 'ALL',
+            'fields': 'ad_creative_bodies,page_name,ad_creative_link_titles,ad_creative_link_descriptions,ad_delivery_start_time,impressions',
+            'limit': '8',
+            'access_token': META_TOKEN
+        })
+        data = http_req(f'https://graph.facebook.com/v21.0/ads_archive?{params}')
+        return data.get('data', [])
+    except Exception as e:
+        print(f'Ads Library error: {e}')
+        return []
+
 def claude(prompt, system=None):
     data = {
         'model': 'claude-haiku-4-5-20251001',
@@ -130,7 +168,9 @@ def classify(text, state):
         return 'create_task'
     if any(w in t for w in ['proyección', 'proyectame', 'cuánto necesito', 'forecast', 'estimación']):
         return 'projection'
-    if any(w in t for w in ['competencia', 'competidores', 'benchmark']):
+    if any(w in t for w in ['evaluación de marca', 'salud de marca', 'cómo está la marca', 'análisis de marca', 'evaluar marca', 'evaluá la marca']):
+        return 'brand_eval'
+    if any(w in t for w in ['competencia', 'competidores', 'benchmark', 'competidor']):
         return 'research'
     if any(w in t for w in ['copy', 'copies', 'redactame', 'escribime', 'variantes', 'texto para']):
         return 'copies'
@@ -536,52 +576,148 @@ Devolvé SOLO JSON válido:
     return state
 
 def h_research(text, state):
-    prompt = f"""Research de competencia para una agencia de marketing digital. Solicitud: "{text}"
+    # Extraer nombre del competidor del texto
+    t = text.lower()
+    # Remover palabras clave de activación para quedarnos con el tema
+    competitor_raw = re.sub(r'\b(competencia|competidores|benchmark|analiza|investigá|research)\b', '', text, flags=re.IGNORECASE).strip()
+    competitor = competitor_raw[:60] if competitor_raw else text[:60]
 
-Usá tu conocimiento sobre el sector y competidores mencionados para dar información concreta y accionable. Enfocate en qué mensajes usan en sus anuncios, qué formatos priorizan y dónde hay huecos para diferenciarse.
+    tg_send('🔍 Buscando info... un segundo.')
 
-Respondé en español con Markdown para Telegram (máx 300 palabras):
+    # 1. Meta Ads Library — anuncios reales del competidor
+    ads = meta_ads_library(competitor)
+    ads_context = ''
+    if ads:
+        ads_context = f'\n\nAnuncios reales encontrados en Meta Ads Library ({len(ads)}):\n'
+        for ad in ads[:5]:
+            page = ad.get('page_name', '')
+            bodies = ad.get('ad_creative_bodies', [])
+            titles = ad.get('ad_creative_link_titles', [])
+            body_text = bodies[0] if bodies else ''
+            title_text = titles[0] if titles else ''
+            ads_context += f'- Página: {page} | Título: {title_text} | Copy: {body_text[:150]}\n'
 
-🔍 *Research: [competidor/sector]*
+    # 2. DuckDuckGo para contexto adicional
+    web_ctx = web_search(f'{competitor} publicidad digital marketing estrategia')
 
-🏢 *Posicionamiento y mensaje central:* [descripción concreta]
+    prompt = f"""Research de competencia. Solicitud original: "{text}"
+Competidor/sector analizado: {competitor}
+{ads_context}
+Contexto web adicional: {web_ctx[:1000] if web_ctx else 'No disponible'}
 
-📢 *Estrategia publicitaria típica:*
-• [punto específico con ejemplo]
-• [punto específico con ejemplo]
-• [punto específico con ejemplo]
+Con esta información real (priorizar los datos de Meta Ads Library si están disponibles), generá un análisis accionable en español con Markdown para Telegram (máx 320 palabras):
 
-💡 *Ángulos creativos más usados:*
-• [ángulo — por qué funciona]
-• [ángulo — por qué funciona]
+🔍 *Research: {competitor}*
 
-🎯 *Gaps y oportunidades:*
-• [diferenciador accionable]
-• [diferenciador accionable]
+🏢 *Posicionamiento y mensaje central:* [basado en los ads reales si los hay]
 
-¿Querés que arme ángulos concretos para un cliente tuyo vs este competidor?"""
+📢 *Lo que están comunicando en sus anuncios:*
+• [mensaje/ángulo real con ejemplo de copy]
+• [mensaje/ángulo real con ejemplo de copy]
+• [mensaje/ángulo real con ejemplo de copy]
+
+💡 *Formatos y creatividades:* [qué están usando]
+
+🎯 *Gaps — dónde se puede superar:*
+• [oportunidad concreta]
+• [oportunidad concreta]
+
+¿Querés que arme ángulos específicos para alguno de tus clientes vs este competidor?"""
+
     tg_send(claude(prompt))
     return state
 
 def h_trends(text, state):
     now = datetime.now()
+    tg_send('📡 Buscando tendencias actuales...')
+
+    # DuckDuckGo para contexto web reciente
+    web_ctx = web_search(f'Meta Ads tendencias publicidad digital {now.strftime("%Y")}')
+    web_ctx2 = web_search(f'Facebook Ads algorithm changes {now.strftime("%B %Y")}')
+
     prompt = f"""Tendencias de publicidad digital. Solicitud: "{text}"
+Fecha actual: {now.strftime("%B %Y")}.
 
-Fecha actual: {now.strftime("%B %Y")}. Sos experta en Meta Ads y Google Ads. Compartí tendencias y cambios que están impactando el rendimiento de campañas AHORA — formatos que están ganando alcance, cambios en el algoritmo, estrategias que están funcionando mejor, etc. Sé específica y accionable.
+Contexto web reciente:
+{(web_ctx + ' | ' + web_ctx2)[:2000] if (web_ctx or web_ctx2) else 'No disponible'}
 
-Respondé en español con Markdown para Telegram (máx 300 palabras):
+Sos experta en Meta Ads y Google Ads. Usando el contexto web anterior Y tu conocimiento, compartí las tendencias más relevantes con impacto práctico real. Sé específica — mencioná formatos, cambios de algoritmo, tipos de campaña, estrategias concretas.
+
+Respondé en español con Markdown para Telegram (máx 320 palabras):
 
 📡 *Tendencias — {now.strftime("%B %Y")}*
 
-1️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
-2️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
-3️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
-4️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
+1️⃣ *[tendencia específica]:* [qué está pasando + qué hacer]
+2️⃣ *[tendencia específica]:* [qué está pasando + qué hacer]
+3️⃣ *[tendencia específica]:* [qué está pasando + qué hacer]
+4️⃣ *[tendencia específica]:* [qué está pasando + qué hacer]
 
-⚡ *Acción rápida:* [algo concreto para implementar hoy]
+⚡ *Acción rápida para esta semana:* [algo concreto y aplicable hoy]
 
 ¿Querés aplicar alguna a un cliente específico?"""
+
     tg_send(claude(prompt))
+    return state
+
+def h_brand_eval(text, state):
+    client = detect_client(text)
+    if not client:
+        tg_send('¿Para qué cliente querés la evaluación de marca?\n\n• BHU/UIN\n• EBDS\n• Goya\n• Somostec\n• Pediapartner')
+        return state
+    if 'meta' not in client:
+        tg_send(f'❌ {client["name"]} no tiene Meta Ads configurado.')
+        return state
+
+    tg_send(f'📊 Analizando {client["name"]}... un momento.')
+
+    try:
+        # 90 días con desglose mensual
+        url_90 = (f'https://graph.facebook.com/v21.0/{client["meta"]}/insights'
+                  f'?fields=spend,reach,impressions,clicks,ctr,cpc,cpm,frequency'
+                  f'&date_preset=last_90d&level=account&time_increment=monthly'
+                  f'&access_token={META_TOKEN}')
+        data_90 = http_req(url_90).get('data', [])
+
+        # Últimos 7 días para comparar con el mes anterior
+        url_7 = (f'https://graph.facebook.com/v21.0/{client["meta"]}/insights'
+                 f'?fields=spend,reach,impressions,clicks,ctr,cpc,cpm'
+                 f'&date_preset=last_7d&level=account'
+                 f'&access_token={META_TOKEN}')
+        data_7 = http_req(url_7).get('data', [{}])
+
+        prompt = f"""Evaluación de salud de marca en Meta Ads para {client['name']}.
+
+Datos últimos 90 días (por mes): {json.dumps(data_90)}
+Datos últimos 7 días: {json.dumps(data_7)}
+
+Analizá la evolución de la marca. Identificá tendencias positivas y negativas. Comparar contra benchmarks: CTR bueno ≥1.5%, CPC eficiente, frecuencia ideal 1.5–3.0, CPM razonable para Argentina.
+
+Respondé en español con Markdown para Telegram (máx 380 palabras):
+
+🏷️ *Evaluación de marca — {client['name']}*
+_Últimos 90 días · Meta Ads_
+
+📈 *Evolución mensual:* [describe la tendencia — está creciendo, estancada, cayendo?]
+
+✅ *Fortalezas detectadas:*
+• [métrica buena con dato concreto]
+• [métrica buena con dato concreto]
+
+⚠️ *Alertas:*
+• [problema con dato concreto + por qué importa]
+• [problema con dato concreto + por qué importa]
+
+🎯 *3 acciones prioritarias:*
+1. [acción específica + impacto esperado]
+2. [acción específica + impacto esperado]
+3. [acción específica + impacto esperado]
+
+¿Querés que profundice en alguna campaña específica?"""
+
+        tg_send(claude(prompt, system='Sos una estratega de performance marketing con 10 años de experiencia en Meta Ads para el mercado latinoamericano.'))
+    except Exception as e:
+        tg_send(f'❌ Error al obtener datos: {str(e)}')
+
     return state
 
 def check_validar(state):
@@ -631,10 +767,11 @@ def process(text, state):
         'trends':        h_trends,
         'projection':    h_projection,
         'draft_meta':    h_draft_meta,
+        'brand_eval':    h_brand_eval,
     }
     if intent in handlers:
         return handlers[intent](text, state)
-    tg_send('No entendí bien. ¿Qué necesitás?\n\n1️⃣ Análisis de campañas\n2️⃣ Crear tarea para Stefania\n3️⃣ Proyección de campaña\n4️⃣ Research de competencia\n5️⃣ Redactar copies\n6️⃣ Tendencias Meta/Google\n7️⃣ Crear draft en Meta Ads')
+    tg_send('No entendí bien. ¿Qué necesitás?\n\n1️⃣ Análisis de campañas\n2️⃣ Crear tarea para Stefania\n3️⃣ Proyección de campaña\n4️⃣ Research de competencia\n5️⃣ Redactar copies\n6️⃣ Tendencias Meta/Google\n7️⃣ Crear draft en Meta Ads\n8️⃣ Evaluación de marca')
     return state
 
 # --- Vercel handler ---
