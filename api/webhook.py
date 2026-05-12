@@ -1,4 +1,4 @@
-import json, os, re
+import json, os, re, csv, tempfile
 import urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler
 from datetime import datetime
@@ -19,7 +19,9 @@ CLIENTS = {
     'behind':   {'name': 'BHU/UIN', 'meta': 'act_2249213495344845', 'list_id': '901326439751', 'done': 'hecho'},
     'ebds':     {'name': 'EBDS',    'meta': 'act_2249213495344845', 'list_id': '901324498269', 'done': 'done'},
     'goya':     {'name': 'Goya',    'meta': 'act_2677321078947278', 'done': 'done'},
-    'somostec': {'name': 'Somostec','meta': 'act_865020240718182',  'done': 'done'},
+    'somostec': {'name': 'Somostec','meta': 'act_2001890360733504', 'done': 'done'},
+    'pediapartner': {'name': 'Pediapartner', 'meta': 'act_882383240407303', 'done': 'done'},
+    'pedia':     {'name': 'Pediapartner', 'meta': 'act_882383240407303', 'done': 'done'},
     'tivenos':  {'name': 'Tivenos', 'list_id': '901324496237', 'done': 'done'},
     'sibila':   {'name': 'Sibila',  'list_id': '901324495956', 'done': 'done'},
     'zoweare':  {'name': 'ZoWeAre', 'done': 'done'},
@@ -46,6 +48,22 @@ def tg_send(text):
         f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
         'POST', {'chat_id': SOFIA_CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}
     )
+
+def tg_send_document(filepath, filename, caption=''):
+    boundary = 'boundary7MA4YWxkTr'
+    with open(filepath, 'rb') as f:
+        file_data = f.read()
+    body = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{SOFIA_CHAT_ID}\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\nContent-Type: text/csv\r\n\r\n'
+    ).encode() + file_data + f'\r\n--{boundary}--\r\n'.encode()
+    req = urllib.request.Request(
+        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument',
+        data=body, headers={'Content-Type': f'multipart/form-data; boundary={boundary}'}, method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
 
 def cu_get(path):
     return http_req(f'https://api.clickup.com/api/v2/{path}', headers={'Authorization': CLICKUP_TOKEN})
@@ -436,65 +454,101 @@ def h_correct_validar(text, state):
 def h_copies(text, state):
     prompt = f"""El usuario pidió copies para Meta Ads: "{text}"
 
-Generá 3 variantes con ángulos distintos. Formato Telegram Markdown en español:
+Generá 3 variantes de copy con ángulos distintos (beneficio, dolor, curiosidad).
+Devolvé SOLO JSON válido, sin explicaciones extra:
+{{"copies": [{{"variante": 1, "angulo": "beneficio", "headline": "...", "cuerpo": "...", "cta": "..."}}, {{"variante": 2, "angulo": "dolor", "headline": "...", "cuerpo": "...", "cta": "..."}}, {{"variante": 3, "angulo": "curiosidad", "headline": "...", "cuerpo": "...", "cta": "..."}}]}}"""
 
-✍️ *Copies para [cliente] — [formato]*
+    copies_data = None
+    try:
+        result = claude(prompt)
+        match = re.search(r'\{.*\}', result, re.DOTALL)
+        if match:
+            copies_data = json.loads(match.group())
+    except Exception:
+        pass
 
-*Variante 1 — [ángulo]:*
-[headline]
-[cuerpo]
-[CTA]
+    if not copies_data or 'copies' not in copies_data:
+        tg_send(claude(f'Generá 3 copies para Meta Ads en español: "{text}". Incluí headline, cuerpo y CTA para cada variante.'))
+        return state
 
-*Variante 2 — [ángulo]:*
-[headline]
-[cuerpo]
-[CTA]
+    copies = copies_data['copies']
 
-*Variante 3 — [ángulo]:*
-[headline]
-[cuerpo]
-[CTA]
+    # Telegram text version
+    lines = ['✍️ *Copies generados*\n']
+    for c in copies:
+        lines.append(
+            f'*Variante {c["variante"]} — {c.get("angulo", "")}:*\n'
+            f'*Headline:* {c.get("headline", "")}\n'
+            f'{c.get("cuerpo", "")}\n'
+            f'*CTA:* _{c.get("cta", "")}_\n'
+        )
+    lines.append('¿Usás alguna tal cual o querés ajustes?')
+    tg_send('\n'.join(lines))
 
-¿Usás alguna tal cual o querés ajustes?"""
-    tg_send(claude(prompt))
+    # CSV file version
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False,
+                                         encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Variante', 'Ángulo', 'Headline', 'Cuerpo', 'CTA', 'Estado', 'Notas'])
+            for c in copies:
+                writer.writerow([
+                    c.get('variante', ''), c.get('angulo', ''),
+                    c.get('headline', ''), c.get('cuerpo', ''),
+                    c.get('cta', ''), '', ''
+                ])
+            tmppath = f.name
+        tg_send_document(tmppath, 'copies.csv', '📎 Copies para revisar — abrí en Excel o Google Sheets')
+        os.unlink(tmppath)
+    except Exception as e:
+        print(f'CSV error: {e}')
+
     return state
 
 def h_research(text, state):
-    prompt = f"""Research de competencia solicitado: "{text}"
+    prompt = f"""Research de competencia para una agencia de marketing digital. Solicitud: "{text}"
 
-Respondé en español con Markdown para Telegram:
+Usá tu conocimiento sobre el sector y competidores mencionados para dar información concreta y accionable. Enfocate en qué mensajes usan en sus anuncios, qué formatos priorizan y dónde hay huecos para diferenciarse.
+
+Respondé en español con Markdown para Telegram (máx 300 palabras):
 
 🔍 *Research: [competidor/sector]*
 
-🏢 *Posicionamiento:* [descripción]
+🏢 *Posicionamiento y mensaje central:* [descripción concreta]
 
 📢 *Estrategia publicitaria típica:*
-• [punto 1]
-• [punto 2]
+• [punto específico con ejemplo]
+• [punto específico con ejemplo]
+• [punto específico con ejemplo]
 
 💡 *Ángulos creativos más usados:*
-• [ángulo 1]
-• [ángulo 2]
+• [ángulo — por qué funciona]
+• [ángulo — por qué funciona]
 
-🎯 *Oportunidades de diferenciación:*
-• [diferenciador 1]
-• [diferenciador 2]
+🎯 *Gaps y oportunidades:*
+• [diferenciador accionable]
+• [diferenciador accionable]
 
-¿Querés que profundice en algún punto?"""
+¿Querés que arme ángulos concretos para un cliente tuyo vs este competidor?"""
     tg_send(claude(prompt))
     return state
 
 def h_trends(text, state):
-    prompt = f"""Tendencias de publicidad digital solicitadas: "{text}"
+    now = datetime.now()
+    prompt = f"""Tendencias de publicidad digital. Solicitud: "{text}"
 
-Respondé en español con Markdown para Telegram:
+Fecha actual: {now.strftime("%B %Y")}. Sos experta en Meta Ads y Google Ads. Compartí tendencias y cambios que están impactando el rendimiento de campañas AHORA — formatos que están ganando alcance, cambios en el algoritmo, estrategias que están funcionando mejor, etc. Sé específica y accionable.
 
-📡 *Tendencias [Meta/Google Ads] — {datetime.now().strftime("%B %Y")}*
+Respondé en español con Markdown para Telegram (máx 300 palabras):
 
-1️⃣ [tendencia]: [explicación + impacto práctico]
-2️⃣ [tendencia]: [explicación + impacto práctico]
-3️⃣ [tendencia]: [explicación + impacto práctico]
-4️⃣ [tendencia]: [explicación + impacto práctico]
+📡 *Tendencias — {now.strftime("%B %Y")}*
+
+1️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
+2️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
+3️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
+4️⃣ *[tendencia]:* [qué está pasando + qué hacer esta semana]
+
+⚡ *Acción rápida:* [algo concreto para implementar hoy]
 
 ¿Querés aplicar alguna a un cliente específico?"""
     tg_send(claude(prompt))
