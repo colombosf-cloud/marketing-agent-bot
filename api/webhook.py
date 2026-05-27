@@ -1,13 +1,24 @@
-import json, os, re, csv, tempfile
-import urllib.request, urllib.error
-from http.server import BaseHTTPRequestHandler
+import json, os, re, csv, tempfile, base64
+import urllib.request, urllib.error, urllib.parse
 from datetime import datetime
+import datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Flask, request, Response
+
+app = Flask(__name__)
 
 # --- Config ---
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 CLICKUP_TOKEN = os.environ['CLICKUP_TOKEN']
 META_TOKEN = os.environ['META_TOKEN']
 ANTHROPIC_KEY = os.environ['ANTHROPIC_API_KEY']
+ZOHO_CLIENT_ID     = os.environ.get('ZOHO_CLIENT_ID', '')
+ZOHO_CLIENT_SECRET = os.environ.get('ZOHO_CLIENT_SECRET', '')
+ZOHO_REFRESH_TOKEN = os.environ.get('ZOHO_REFRESH_TOKEN', '')
+# EBDS — datacenter EU (zoho.eu / zohoapis.eu)
+ZOHO_EBDS_CLIENT_ID     = os.environ.get('ZOHO_EBDS_CLIENT_ID', '')
+ZOHO_EBDS_CLIENT_SECRET = os.environ.get('ZOHO_EBDS_CLIENT_SECRET', '')
+ZOHO_EBDS_REFRESH_TOKEN = os.environ.get('ZOHO_EBDS_REFRESH_TOKEN', '')
 STATE_TASK_ID = '86ahd3yp7'
 SOFIA_CHAT_ID = 8799388034
 STEFANIA_ID = 112045438
@@ -25,6 +36,28 @@ CLIENTS = {
     'tivenos':  {'name': 'Tivenos', 'list_id': '901324496237', 'done': 'done'},
     'sibila':   {'name': 'Sibila',  'list_id': '901324495956', 'done': 'done'},
     'zoweare':  {'name': 'ZoWeAre', 'done': 'done'},
+}
+
+CAMPAIGN_CLIENTS = {
+    'bhu':          {'name': 'BHU/UIN',     'account': 'act_2249213495344845', 'page': '329482500949627'},
+    'uin':          {'name': 'BHU/UIN',     'account': 'act_2249213495344845', 'page': '329482500949627'},
+    'behind':       {'name': 'BHU/UIN',     'account': 'act_2249213495344845', 'page': '329482500949627'},
+    'ebds':         {'name': 'EBDS',        'account': 'act_2249213495344845', 'page': '102439669276120'},
+    'somostec':     {'name': 'Somostec',    'account': 'act_2001890360733504', 'page': '100114645473318'},
+    'pediapartner': {'name': 'Pediapartner','account': 'act_882383240407303',  'page': '61562531372652'},
+    'pedia':        {'name': 'Pediapartner','account': 'act_882383240407303',  'page': '61562531372652'},
+}
+
+COUNTRY_CODES = {
+    'argentina': 'AR', 'ar': 'AR',
+    'españa': 'ES', 'spain': 'ES', 'es': 'ES',
+    'mexico': 'MX', 'méxico': 'MX', 'mx': 'MX',
+    'colombia': 'CO', 'co': 'CO',
+    'chile': 'CL', 'cl': 'CL',
+    'peru': 'PE', 'perú': 'PE', 'pe': 'PE',
+    'uruguay': 'UY', 'uy': 'UY',
+    'brasil': 'BR', 'brazil': 'BR', 'br': 'BR',
+    'estados unidos': 'US', 'usa': 'US',
 }
 
 WORKSPACES = {
@@ -49,20 +82,20 @@ def tg_send(text):
         'POST', {'chat_id': SOFIA_CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}
     )
 
-def tg_send_document(filepath, filename, caption=''):
+def tg_send_document(filepath, filename, caption='', mimetype='text/csv'):
     boundary = 'boundary7MA4YWxkTr'
     with open(filepath, 'rb') as f:
         file_data = f.read()
     body = (
         f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{SOFIA_CHAT_ID}\r\n'
         f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'
-        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\nContent-Type: text/csv\r\n\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\nContent-Type: {mimetype}\r\n\r\n'
     ).encode() + file_data + f'\r\n--{boundary}--\r\n'.encode()
     req = urllib.request.Request(
         f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument',
         data=body, headers={'Content-Type': f'multipart/form-data; boundary={boundary}'}, method='POST'
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
 
 def cu_get(path):
@@ -73,6 +106,161 @@ def cu_post(path, data):
 
 def cu_put(path, data):
     return http_req(f'https://api.clickup.com/api/v2/{path}', 'PUT', data, {'Authorization': CLICKUP_TOKEN})
+
+# --- Zoho CRM ---
+_zoho_tokens = {'bhu': {'token': '', 'expires': 0}, 'ebds': {'token': '', 'expires': 0}}
+
+def zoho_get_token(client='bhu'):
+    """Obtiene access token de Zoho. BHU usa zoho.com, EBDS usa zoho.eu."""
+    cache = _zoho_tokens[client]
+    now = datetime.utcnow().timestamp()
+    if cache['token'] and now < cache['expires']:
+        return cache['token']
+    if client == 'ebds':
+        cid, csec, rtok = ZOHO_EBDS_CLIENT_ID, ZOHO_EBDS_CLIENT_SECRET, ZOHO_EBDS_REFRESH_TOKEN
+        auth_url = 'https://accounts.zoho.eu/oauth/v2/token'
+    else:
+        cid, csec, rtok = ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN
+        auth_url = 'https://accounts.zoho.com/oauth/v2/token'
+    params = urllib.parse.urlencode({'grant_type': 'refresh_token', 'client_id': cid, 'client_secret': csec, 'refresh_token': rtok})
+    req = urllib.request.Request(f'{auth_url}?{params}', data=b'', method='POST')
+    with urllib.request.urlopen(req, timeout=15) as r:
+        resp = json.loads(r.read())
+    token = resp.get('access_token', '')
+    cache['token'] = token
+    cache['expires'] = now + 3300
+    return token
+
+def zoho_get(path, params=None, client='bhu'):
+    token = zoho_get_token(client)
+    api_domain = 'https://www.zohoapis.eu' if client == 'ebds' else 'https://www.zohoapis.com'
+    url = f'{api_domain}/crm/v2/{path}'
+    if params:
+        url += '?' + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={'Authorization': f'Zoho-oauthtoken {token}'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+def zoho_crm_funnel():
+    """
+    Funnel completo BHU/UIN:
+      - Leads module  → sin contactar
+      - Deals module  → stages del pipeline
+    Stages: 1.Contactado / 2.Interesado / 3.Evaluando / 4.Promesa de Pago /
+            8.Validado para facturar comisión / 5-7 Estudiante/Inscripto / 99.Perdido
+    """
+    from collections import Counter
+    try:
+        # --- Leads (no contactados aún) ---
+        leads_data = zoho_get('Leads', {
+            'per_page': 200,
+            'fields': 'Lead_Status,Lead_Source,Created_Time,Programa_UIN'
+        }).get('data', [])
+
+        leads_por_estado = Counter(l.get('Lead_Status') or 'Sin gestión' for l in leads_data)
+        leads_por_fuente = Counter(l.get('Lead_Source') or 'Sin fuente'  for l in leads_data)
+
+        # --- Deals (pipeline de oportunidades) ---
+        deals_data = zoho_get('Deals', {
+            'per_page': 200,
+            'fields': 'Stage,Programa_UIN,Lead_Source,Unidad_de_Negocio,Created_Time'
+        }).get('data', [])
+
+        # Clasificar stages
+        ESTUDIANTE_STAGES = {'8. validado para facturar comisión', '5. estudiante', '6. inscripto',
+                             '7. validado para comision', 'estudiante', 'inscripto', 'validado'}
+        PERDIDO_STAGES    = {'99. perdido', 'perdido', '99.perdido'}
+
+        stages = Counter(d.get('Stage') or 'Sin etapa' for d in deals_data)
+        programas = Counter(d.get('Programa_UIN') or 'Sin programa' for d in deals_data if d.get('Stage','').lower() not in PERDIDO_STAGES)
+
+        # Agrupar en funnel
+        funnel = {
+            'leads_sin_contactar': sum(leads_por_estado.values()),
+            'contactados':    0, 'interesados': 0, 'evaluando': 0,
+            'promesa_pago':   0, 'estudiantes': 0, 'perdidos':  0,
+        }
+        for stage, count in stages.items():
+            sl = stage.lower()
+            if '1.' in sl or 'contactado' in sl:  funnel['contactados']   += count
+            elif '2.' in sl or 'interesado' in sl: funnel['interesados']  += count
+            elif '3.' in sl or 'evaluando'  in sl: funnel['evaluando']    += count
+            elif '4.' in sl or 'promesa'    in sl: funnel['promesa_pago'] += count
+            elif any(s in sl for s in ESTUDIANTE_STAGES): funnel['estudiantes'] += count
+            elif any(s in sl for s in PERDIDO_STAGES):    funnel['perdidos']    += count
+
+        total_deals = len(deals_data)
+        return {
+            'leads_total':        funnel['leads_sin_contactar'],
+            'leads_por_estado':   dict(leads_por_estado.most_common()),
+            'leads_por_fuente':   dict(leads_por_fuente.most_common(6)),
+            'deals_total':        total_deals,
+            'funnel':             funnel,
+            'stages_raw':         dict(stages.most_common()),
+            'top_programas':      dict(programas.most_common(6)),
+        }
+    except Exception as e:
+        print(f'Zoho funnel error: {e}')
+        return None
+
+def zoho_crm_funnel_ebds():
+    """Funnel EBDS CRM — datacenter EU, pipeline propio."""
+    from collections import Counter
+    try:
+        leads_data = zoho_get('Leads', {
+            'per_page': 200,
+            'fields': 'Lead_Status,Lead_Source,Created_Time'
+        }, client='ebds').get('data', [])
+        leads_por_estado = Counter(l.get('Lead_Status') or 'Sin gestión' for l in leads_data)
+        leads_por_fuente = Counter(l.get('Lead_Source') or 'Sin fuente'  for l in leads_data)
+
+        deals_data = zoho_get('Deals', {
+            'per_page': 200,
+            'fields': 'Stage,Programa_Academico,Programa_largo,Lead_Source,Created_Time'
+        }, client='ebds').get('data', [])
+
+        INSCRITO_STAGES  = {'inscrito / pendiente de otorgar accesos', 'estudiante', 'inscrito'}
+        PERDIDO_STAGES   = {'no interesado', 'perdido', 'no interesado/perdido'}
+
+        stages   = Counter(d.get('Stage') or 'Sin etapa' for d in deals_data)
+        programas = Counter()
+        for d in deals_data:
+            if (d.get('Stage') or '').lower() in PERDIDO_STAGES:
+                continue
+            prog = d.get('Programa_largo') or ''
+            if not prog:
+                prog_obj = d.get('Programa_Academico')
+                if isinstance(prog_obj, dict):
+                    prog = prog_obj.get('name', '')
+            if prog:
+                programas[prog] += 1
+
+        funnel = {
+            'leads_sin_contactar': sum(leads_por_estado.values()),
+            'contactados': 0, 'interesados': 0, 'evaluando': 0,
+            'promesa_pago': 0, 'estudiantes': 0, 'perdidos': 0,
+        }
+        for stage, count in stages.items():
+            sl = stage.lower()
+            if 'contactado'  in sl: funnel['contactados']  += count
+            elif 'interesado' in sl: funnel['interesados']  += count
+            elif 'evaluando'  in sl: funnel['evaluando']    += count
+            elif 'promesa'    in sl: funnel['promesa_pago'] += count
+            elif any(s in sl for s in INSCRITO_STAGES): funnel['estudiantes'] += count
+            elif any(s in sl for s in PERDIDO_STAGES):  funnel['perdidos']    += count
+
+        return {
+            'leads_total':      funnel['leads_sin_contactar'],
+            'leads_por_estado': dict(leads_por_estado.most_common()),
+            'leads_por_fuente': dict(leads_por_fuente.most_common(6)),
+            'deals_total':      len(deals_data),
+            'funnel':           funnel,
+            'stages_raw':       dict(stages.most_common()),
+            'top_programas':    dict(programas.most_common(6)),
+        }
+    except Exception as e:
+        print(f'Zoho EBDS funnel error: {e}')
+        return None
 
 def web_search(query):
     """DuckDuckGo Instant Answers — no API key needed"""
@@ -112,33 +300,58 @@ def meta_ads_library(competitor, country='AR'):
         print(f'Ads Library error: {e}')
         return []
 
-def claude(prompt, system=None):
+def claude(prompt, system=None, max_tokens=1024):
     data = {
         'model': 'claude-haiku-4-5-20251001',
-        'max_tokens': 1024,
+        'max_tokens': max_tokens,
         'messages': [{'role': 'user', 'content': prompt}]
     }
     if system:
         data['system'] = system
-    result = http_req('https://api.anthropic.com/v1/messages', 'POST', data, {
-        'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01'
-    })
+    h = {'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01'}
+    body = json.dumps(data).encode()
+    req = urllib.request.Request('https://api.anthropic.com/v1/messages', data=body, headers=h, method='POST')
+    with urllib.request.urlopen(req, timeout=90) as r:
+        result = json.loads(r.read())
     return result['content'][0]['text']
 
 # --- State ---
+STATE_DEFAULTS = {
+    'last_offset': 0,
+    'notified_validar_tasks': [],
+    'active_conversation': None,
+    'pending_approvals': [],
+    'calendar': {},
+    'last_post_ids': {},
+}
+
 def read_state():
+    """Lee el estado del bot desde ClickUp. Siempre garantiza que todas las claves estándar estén presentes."""
+    loaded = {}
     try:
         task = cu_get(f'task/{STATE_TASK_ID}')
-        desc = task.get('description', '')
+        desc = task.get('description', '') or ''
         if desc:
-            return json.loads(desc)
+            try:
+                decoded = base64.b64decode(desc.strip().encode()).decode('utf-8')
+                loaded = json.loads(decoded)
+            except Exception:
+                try:
+                    loaded = json.loads(desc)
+                except Exception:
+                    pass
     except Exception:
         pass
-    return {'last_offset': 0, 'notified_validar_tasks': [], 'active_conversation': None, 'pending_approvals': []}
+    # Merge defaults — ensures all keys exist even if state was saved partially
+    state = dict(STATE_DEFAULTS)
+    state.update(loaded)
+    return state
 
 def save_state(state):
+    """Guarda estado en ClickUp codificado en base64 para evitar que ClickUp altere los caracteres."""
     state['last_run'] = datetime.utcnow().isoformat() + 'Z'
-    cu_put(f'task/{STATE_TASK_ID}', {'description': json.dumps(state)})
+    encoded = base64.b64encode(json.dumps(state, ensure_ascii=False).encode('utf-8')).decode('ascii')
+    cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': encoded})
 
 # --- Helpers ---
 def detect_client(text):
@@ -158,11 +371,41 @@ def classify(text, state):
         return 'continue'
     if t in ['ok', 'aprobado', 'dale', 'sí', 'si', 'adelante'] and state.get('pending_approvals'):
         return 'approve_own'
-    if re.match(r'^ok .+', t) and not state.get('pending_approvals'):
-        return 'approve_validar'
     if re.match(r'^correcciones .+:.+', t, re.DOTALL):
         return 'correct_validar'
-    if any(w in t for w in ['campaña', 'campañas', 'performance', 'resultados', 'leads', 'gastaron', 'profundiza', 'cómo están']) or detect_client(t):
+    # Aprobación de tarea validar — formato "ok [nombre]" o lenguaje natural
+    notified = state.get('notified_validar_tasks', [])
+    if notified:
+        if re.match(r'^ok .+', t):
+            return 'approve_validar'
+        if any(w in t for w in ['aprobado', 'aprobá', 'aprobar', 'pásala a done', 'pasá a done', 'mandala a done', 'marcar como done', 'está ok', 'dale con']):
+            return 'approve_validar'
+        # Si el nombre de alguna tarea notificada aparece en el mensaje
+        for task in notified:
+            if isinstance(task, dict):
+                name = task.get('name', '').lower()
+                if name and name in t:
+                    return 'approve_validar'
+    # Calendario tiene prioridad sobre campaigns (el texto puede contener nombre de cliente)
+    if any(w in t for w in ['calendario', 'armame el contenido', 'armá el contenido', 'generar contenido del mes',
+                             'planificar mes', 'contenido de', 'contenido orgánico', 'contenido organico',
+                             'armame el calendario', 'armá el calendario', 'genera el contenido', 'generá el contenido',
+                             'generame contenido', 'genérame contenido', 'parrilla de contenido',
+                             'posteos de', 'posts de', 'redes sociales de', 'genera contenido']):
+        return 'calendar'
+    if any(w in t for w in ['rehaceme', 'rehace', 'rehacer', 'regenera', 'regenerame', 'otra versión', 'otra version', 'nueva versión', 'nueva version', 'volvé a generar', 'vuelve a generar', 'cambiá el post', 'cambia el post', 'no me gusta']):
+        return 'regen_post'
+    if any(w in t for w in ['crear campaña', 'nueva campaña', 'draft en meta', 'armame una campaña', 'armá una campaña', 'campaña para', 'quiero una campaña', 'lanzar campaña']):
+        return 'draft_meta'
+    if any(w in t for w in ['reporte semanal', 'reporte paid', 'reporte mensual', 'genera el reporte',
+                             'generá el reporte', 'dame el reporte', 'reporte html', 'reporte de paid',
+                             'reporte bhu', 'reporte ebds', 'reporte uin']):
+        return 'paid_report'
+    if any(w in t for w in ['crm', 'leads del crm', 'pipeline', 'inscriptos', 'inscripciones', 'conversiones crm', 'cuántos leads', 'estado de leads']):
+        return 'crm_report'
+    # detect_client solo dispara campaigns si hay palabras de Meta/performance; si no, puede ser otra intención
+    meta_words = ['campaña', 'campañas', 'performance', 'resultados', 'leads', 'gastaron', 'profundiza', 'cómo están', 'meta ads', 'inversión', 'gasto', 'cpl', 'ctr', 'roas']
+    if any(w in t for w in meta_words) or (detect_client(t) and any(w in t for w in meta_words + ['cómo va', 'anuncios', 'pauta', 'paid'])):
         return 'campaigns'
     if any(w in t for w in ['tarea', 'gráfica', 'diseño', 'stefania', 'anuncio', 'pieza', 'necesito crear']):
         return 'create_task'
@@ -176,14 +419,105 @@ def classify(text, state):
         return 'copies'
     if any(w in t for w in ['tendencias', 'novedades', 'qué hay de nuevo', 'actualización']):
         return 'trends'
-    if any(w in t for w in ['crear campaña', 'nueva campaña', 'draft en meta']):
-        return 'draft_meta'
     return 'unknown'
 
 # --- Handlers ---
+def h_crm_report(text, state):
+    """Reporte del CRM — BHU (zoho.com) o EBDS (zoho.eu)."""
+    t = text.lower()
+    is_ebds = 'ebds' in t
+    client_name = 'EBDS' if is_ebds else 'BHU/UIN'
+    meta_account = 'act_2249213495344845'
+
+    tg_send(f'📊 Consultando CRM de {client_name}...')
+    funnel = zoho_crm_funnel_ebds() if is_ebds else zoho_crm_funnel()
+    if not funnel:
+        tg_send('❌ No pude conectar con el CRM. Verificá las credenciales.')
+        return state
+
+    want_pdf = any(w in t for w in ['pdf', 'reporte', 'archivo', 'documento', 'informe', 'exporta'])
+
+    # Siempre traer Meta Ads para cruzar con CRM
+    meta_data = []
+    try:
+        url = (f'https://graph.facebook.com/v21.0/act_2249213495344845/insights'
+               f'?fields=campaign_name,adset_name,spend,impressions,clicks,ctr,actions,cost_per_action_type'
+               f'&date_preset=last_30d&level=adset&limit=100&access_token={META_TOKEN}')
+        all_data = http_req(url).get('data', [])
+        # Filtrar por cliente: EBDS → solo campañas con "EBDS" en el nombre; BHU → excluir "EBDS"
+        if is_ebds:
+            meta_data = [c for c in all_data if 'ebds' in c.get('campaign_name', '').lower()]
+        else:
+            meta_data = [c for c in all_data if 'ebds' not in c.get('campaign_name', '').lower()]
+    except Exception as e:
+        print(f'Meta for CRM cross: {e}')
+
+    f = funnel['funnel']
+    total_en_pipeline = f['contactados'] + f['interesados'] + f['evaluando'] + f['promesa_pago'] + f['estudiantes']
+    conv_rate = round(f['estudiantes'] / total_en_pipeline * 100, 1) if total_en_pipeline else 0
+
+    prompt = f"""Generá un reporte de CRM para {client_name} en español neutro para Telegram (Markdown).
+
+FUNNEL COMPLETO:
+- Leads sin contactar (Leads module): {f['leads_sin_contactar']}
+- 1. Contactados (Deals): {f['contactados']}
+- 2. Interesados: {f['interesados']}
+- 3. Evaluando: {f['evaluando']}
+- 4. Promesa de pago: {f['promesa_pago']}
+- Inscriptos/Estudiantes (convertidos): {f['estudiantes']}
+- Perdidos/No interesados: {f['perdidos']}
+- Tasa de conversión (contactado → inscripto): {conv_rate}%
+
+TOP PROGRAMAS (en pipeline activo):
+{json.dumps(funnel['top_programas'], ensure_ascii=False)}
+
+FUENTES DE LEADS:
+{json.dumps(funnel['leads_por_fuente'], ensure_ascii=False)}
+
+{('META ADS — conjuntos activos últimos 30d (nivel adset):\n' + json.dumps([{"adset": c.get("adset_name",""), "campaign": c.get("campaign_name",""), "spend": c.get("spend",0), "leads": sum(int(a.get("value",0)) for a in (c.get("actions") or []) if a.get("action_type") in ("lead","onsite_conversion.lead_grouped")), "ctr": c.get("ctr",0)} for c in meta_data[:15]], ensure_ascii=False)) if meta_data else 'Meta Ads: sin datos'}
+
+Formato para Telegram con Markdown:
+📊 *{client_name} — CRM + Meta Ads*
+
+**Funnel CRM:**
+[cada etapa con número y % sobre deals activos, flecha → entre etapas]
+
+**Meta Ads — por campaña y conjunto:**
+[agrupar por campaña; dentro de cada campaña listar sus conjuntos de anuncios con nombre, gasto, leads y CPL — el nombre del conjunto suele indicar el programa o audiencia]
+
+**Top programas en pipeline:**
+[los 4-5 más demandados]
+
+**Fuentes de leads:**
+[de dónde vienen]
+
+**Cruce Meta → CRM:**
+[leads generados en Meta vs contactados en CRM, calidad del tráfico, cuello de botella]
+
+**Alertas:**
+[1-2 acciones concretas]
+
+Máximo 450 palabras."""
+
+    if want_pdf:
+        tg_send('📄 Generando PDF...')
+        try:
+            filepath = generate_paid_media_pdf(client_name, meta_data, funnel)
+            fname = f'Reporte_{client_name.replace("/","_")}_CRM_{dt.date.today()}.pdf'
+            tg_send_document(filepath, fname, caption=f'📊 Reporte BHU/UIN — CRM + Paid Media | {dt.date.today().strftime("%d/%m/%Y")}', mimetype='application/pdf')
+        except Exception as e:
+            print(f'PDF crm error: {e}')
+            tg_send(f'❌ Error generando PDF: {str(e)[:80]}')
+        return state
+
+    tg_send(claude(prompt, max_tokens=700))
+    return state
+
 def h_campaigns(text, state):
-    client = detect_client(text)
-    is_deep = any(w in text.lower() for w in ['profundiza', 'detalle', 'ad set', 'conjunto'])
+    client   = detect_client(text)
+    t        = text.lower()
+    is_deep  = any(w in t for w in ['profundiza', 'detalle', 'ad set', 'conjunto'])
+    want_pdf = any(w in t for w in ['pdf', 'reporte', 'archivo', 'documento', 'informe', 'exporta'])
 
     if not client:
         tg_send('¿Para qué cliente?\n\n• BHU/UIN\n• EBDS\n• Goya\n• Somostec')
@@ -193,29 +527,79 @@ def h_campaigns(text, state):
         tg_send(f'❌ {client["name"]} no tiene Meta Ads disponible.')
         return state
 
-    level = 'adset' if is_deep else 'campaign'
+    # BHU/UIN siempre a nivel adset para ver programas; comparte cuenta con EBDS → filtrar
+    is_bhu = client['name'] in ('BHU/UIN', 'BHU')
+    level = 'adset' if (is_deep or is_bhu) else 'campaign'
     url = (f'https://graph.facebook.com/v21.0/{client["meta"]}/insights'
            f'?fields=campaign_name,adset_name,spend,impressions,clicks,ctr,cpm,cpc,reach,actions,cost_per_action_type'
-           f'&date_preset=last_30d&level={level}&access_token={META_TOKEN}')
+           f'&date_preset=last_30d&level={level}&limit=50&access_token={META_TOKEN}')
     data = http_req(url)
     campaigns = data.get('data', [])
+
+    # Para BHU/UIN: filtrar adsets cuya campaña NO es de EBDS (comparten misma ad account)
+    if is_bhu and campaigns:
+        campaigns = [
+            c for c in campaigns
+            if 'ebds' not in c.get('campaign_name', '').lower()
+        ]
 
     if not campaigns:
         tg_send(f'No hay datos de campañas para {client["name"]} en los últimos 30 días.')
         return state
 
-    prompt = f"""Analizá estos datos de Meta Ads para {client['name']} (últimos 30 días, nivel {level}).
-Datos: {json.dumps(campaigns[:12])}
+    # Enriquecer con CRM según cliente
+    crm_funnel = None
+    if client['name'] in ('BHU/UIN', 'BHU') and ZOHO_REFRESH_TOKEN:
+        try: crm_funnel = zoho_crm_funnel()
+        except Exception: pass
+    elif client['name'] == 'EBDS' and ZOHO_EBDS_REFRESH_TOKEN:
+        try: crm_funnel = zoho_crm_funnel_ebds()
+        except Exception: pass
 
-Generá un resumen conciso para Telegram en español con Markdown:
-- Encabezado: "📊 *{client['name']} — últimos 30 días*"
-- Gasto total
-- Performance de cada campaña/adset: gasto, leads (si hay), CPL, CTR
-- Alertas si hay problemas (CPL alto, sin conversiones, CTR bajo)
-- Cierre: "¿Querés profundizar en alguna campaña?"
-- Máximo 350 palabras"""
+    crm_section = ''
+    if crm_funnel:
+        f = crm_funnel['funnel']
+        total_pipeline = f['contactados'] + f['interesados'] + f['evaluando'] + f['promesa_pago'] + f['estudiantes']
+        conv = round(f['estudiantes'] / total_pipeline * 100, 1) if total_pipeline else 0
+        crm_section = f"""
 
-    tg_send(claude(prompt))
+CRM BHU/UIN — funnel actual:
+- Leads sin contactar: {f['leads_sin_contactar']}
+- Contactados: {f['contactados']} | Interesados: {f['interesados']} | Evaluando: {f['evaluando']}
+- Promesa de pago: {f['promesa_pago']} | Estudiantes convertidos: {f['estudiantes']}
+- Tasa conversión: {conv}% | Perdidos: {f['perdidos']}
+- Top programas: {json.dumps(crm_funnel['top_programas'], ensure_ascii=False)}"""
+
+    if want_pdf:
+        tg_send(f'📄 Generando PDF de {client["name"]}...')
+        try:
+            filepath = generate_paid_media_pdf(client['name'], campaigns, crm_funnel, level=level)
+            fname = f'Reporte_PaidMedia_{client["name"].replace("/","_")}_{dt.date.today()}.pdf'
+            tg_send_document(filepath, fname, caption=f'📊 Reporte Paid Media — {client["name"]} | {dt.date.today().strftime("%d/%m/%Y")}', mimetype='application/pdf')
+        except Exception as e:
+            print(f'PDF campaigns error: {e}')
+            tg_send(f'❌ Error generando PDF: {str(e)[:80]}')
+        return state
+
+    prompt = f"""Análisis de Meta Ads + CRM para {client['name']} (últimos 30 días).
+
+Meta Ads {level}: {json.dumps(campaigns[:10], ensure_ascii=False)}
+{crm_section}
+
+Reporte para Telegram en español neutro con Markdown:
+📊 *{client['name']} — Meta Ads + CRM*
+
+**Meta Ads:**
+- Gasto total, leads generados, CPL, CTR por campaña
+- Alertas (CPL alto, CTR bajo, sin conversiones)
+
+{'**CRM Pipeline:** Funnel leads → contactado → interesado → evaluando → promesa → estudiante. Conversion final, cuello de botella, cruce leads Meta vs CRM.' if crm_funnel else ''}
+
+**Recomendaciones:** 2-3 acciones concretas
+
+Máximo 420 palabras."""
+
+    tg_send(claude(prompt, max_tokens=750))
     return state
 
 def h_create_task(text, state):
@@ -327,48 +711,99 @@ Respondé en español con Markdown:
     return state
 
 def h_draft_meta(text, state):
-    state['active_conversation'] = {'topic': 'draft_meta', 'step': 'cliente', 'data': {}}
-    tg_send('¿Para qué cliente?\n\n• BHU/UIN\n• EBDS\n• Goya\n• Somostec')
+    state['active_conversation'] = {'topic': 'campana_completa', 'step': 'cliente', 'data': {}}
+    tg_send('💼 *Crear campaña en Meta Ads*\n\n¿Para qué cliente?\n\n• BHU/UIN\n• EBDS\n• Somostec\n• Pediapartner')
     return state
 
 def h_draft_meta_step(text, state, conv):
     step = conv['step']
     data = conv['data']
-    steps = ['cliente', 'objetivo', 'nombre', 'presupuesto', 'audiencia']
-    questions = {
-        'objetivo': '¿Cuál es el objetivo?\n\n• LEAD_GENERATION\n• LINK_CLICKS\n• BRAND_AWARENESS\n• OUTCOME_LEADS',
-        'nombre': '¿Cuál es el nombre de la campaña?',
-        'presupuesto': '¿Cuál es el presupuesto diario en USD?',
-        'audiencia': '¿Para qué audiencia? (país, edad, intereses)'
-    }
 
     if step == 'cliente':
-        client = detect_client(text)
-        if not client or 'meta' not in client:
-            tg_send('No encontré ese cliente con Meta Ads. ¿Es BHU, EBDS, Goya o Somostec?')
+        t = text.lower()
+        client_data = next((v for k, v in CAMPAIGN_CLIENTS.items() if k in t), None)
+        if not client_data:
+            tg_send('No reconocí el cliente. ¿Es BHU/UIN, EBDS, Somostec o Pediapartner?')
             return state
-        data['client'] = client
+        data['client'] = client_data
         conv['step'] = 'objetivo'
-        tg_send(questions['objetivo'])
-    elif step in questions:
-        data[step] = text
-        next_step = steps[steps.index(step) + 1] if step != 'audiencia' else None
-        if next_step:
-            conv['step'] = next_step
-            tg_send(questions.get(next_step, ''))
+        tg_send('¿Cuál es el objetivo?\n\n• Leads (captar contactos)\n• Tráfico (visitas al sitio)\n• Awareness (reconocimiento de marca)\n• Ventas (conversiones)')
+
+    elif step == 'objetivo':
+        data['objetivo_raw'] = text
+        t = text.lower()
+        if 'lead' in t:
+            data['objetivo_api'] = 'OUTCOME_LEADS';   data['optim_goal'] = 'LEAD_GENERATION'; data['cta_type'] = 'SIGN_UP'
+        elif any(w in t for w in ['tráfico', 'trafico', 'visita', 'clic', 'click']):
+            data['objetivo_api'] = 'OUTCOME_TRAFFIC';  data['optim_goal'] = 'LINK_CLICKS';      data['cta_type'] = 'LEARN_MORE'
+        elif any(w in t for w in ['aware', 'reconoc', 'marca', 'alcance']):
+            data['objetivo_api'] = 'OUTCOME_AWARENESS'; data['optim_goal'] = 'REACH';           data['cta_type'] = 'LEARN_MORE'
         else:
-            conv['step'] = 'aprobacion'
-            c = data['client']
-            msg = (f'📋 *Resumen del draft*\n\n'
-                   f'🏢 Cliente: {c["name"]}\n'
-                   f'🎯 Objetivo: {data["objetivo"]}\n'
-                   f'📋 Nombre: {data["nombre"]}\n'
-                   f'💰 Presupuesto diario: ${data["presupuesto"]}\n'
-                   f'👥 Audiencia: {data["audiencia"]}\n\n'
-                   f'⏸️ Se creará *PAUSADA* (vos la activás cuando esté lista)\n\n'
-                   f'¿Creo el draft?\n_("ok" para crear)_')
-            tg_send(msg)
-            state['pending_approvals'] = [{'type': 'draft_meta', 'data': data}]
+            data['objetivo_api'] = 'OUTCOME_SALES';   data['optim_goal'] = 'OFFSITE_CONVERSIONS'; data['cta_type'] = 'SHOP_NOW'
+        conv['step'] = 'nombre'
+        tg_send('¿Cuál es el nombre de la campaña?')
+
+    elif step == 'nombre':
+        data['nombre'] = text
+        conv['step'] = 'presupuesto'
+        tg_send('¿Cuál es el presupuesto diario en USD?')
+
+    elif step == 'presupuesto':
+        m = re.search(r'[\d.]+', text)
+        data['presupuesto'] = float(m.group()) if m else 10.0
+        conv['step'] = 'pais_edad'
+        tg_send('¿País y rango de edad?\n_(ej: "Argentina, 25-45")_')
+
+    elif step == 'pais_edad':
+        t = text.lower()
+        country = next((code for name, code in COUNTRY_CODES.items() if name in t), 'AR')
+        age_m = re.search(r'(\d{2})\s*[-–]\s*(\d{2})', text)
+        data['country']  = country
+        data['age_min']  = int(age_m.group(1)) if age_m else 18
+        data['age_max']  = int(age_m.group(2)) if age_m else 65
+        conv['step'] = 'url_destino'
+        tg_send('¿Cuál es la URL de destino? (landing page o sitio web)')
+
+    elif step == 'url_destino':
+        data['url_destino'] = text.strip()
+        conv['step'] = 'imagen'
+        tg_send('¿Link de la imagen?')
+
+    elif step == 'imagen':
+        data['imagen'] = text.strip()
+        # Generate copy with Claude
+        prompt = f"""Copy para Meta Ads.
+Cliente: {data['client']['name']}
+Objetivo: {data.get('objetivo_raw', '')}
+URL destino: {data['url_destino']}
+Devolvé SOLO JSON: {{"headline": "titular impactante (máx 40 chars)", "body": "texto principal persuasivo (2-3 oraciones en español)", "description": "texto secundario corto (máx 25 chars)"}}"""
+        copy_data = {}
+        try:
+            r = claude(prompt)
+            m = re.search(r'\{.*\}', r, re.DOTALL)
+            if m: copy_data = json.loads(m.group())
+        except Exception: pass
+        data['copy'] = copy_data or {'headline': f'Conocé {data["client"]["name"]}', 'body': f'Descubrí todo lo que {data["client"]["name"]} tiene para vos.', 'description': 'Más información'}
+
+        cop = data['copy']
+        msg = (f'📋 *Resumen de campaña*\n\n'
+               f'🏢 Cliente: {data["client"]["name"]}\n'
+               f'🎯 Objetivo: {data["objetivo_raw"]}\n'
+               f'📛 Nombre: {data["nombre"]}\n'
+               f'💰 Presupuesto: ${data["presupuesto"]}/día\n'
+               f'🌎 País: {data["country"]} | Edad: {data["age_min"]}-{data["age_max"]}\n'
+               f'🔗 URL: {data["url_destino"]}\n'
+               f'🖼️ Imagen: _{data["imagen"][:50]}..._\n\n'
+               f'✍️ *Copy generado:*\n'
+               f'• Headline: _{cop.get("headline", "")}_\n'
+               f'• Texto: _{cop.get("body", "")}_\n'
+               f'• Descripción: _{cop.get("description", "")}_\n\n'
+               f'⏸️ Todo se creará *PAUSADO* en Meta Ads.\n\n'
+               f'¿Creo la campaña completa?\n_("ok" para crear | "cambios: [desc]" para ajustar copy)_')
+        tg_send(msg)
+        state['pending_approvals'] = [{'type': 'campana_completa', 'data': data}]
+        state['active_conversation'] = None
+        return state
 
     state['active_conversation'] = conv
     return state
@@ -380,7 +815,7 @@ def h_continue(text, state):
         return h_create_task_step(text, state, conv)
     elif topic == 'proyeccion':
         return h_projection_step(text, state, conv)
-    elif topic == 'draft_meta':
+    elif topic in ('draft_meta', 'campana_completa'):
         return h_draft_meta_step(text, state, conv)
     state['active_conversation'] = None
     return state
@@ -397,21 +832,36 @@ def h_approve_own(text, state):
     if t.startswith('cambios:'):
         changes = text[8:].strip()
         data = approval['data']
-        prompt = f"""Ajustá este copy/brief según las correcciones:
+        if approval['type'] == 'campana_completa':
+            cop = data.get('copy', {})
+            prompt = f"""Ajustá este copy de Meta Ads según las correcciones:
+Headline actual: {cop.get('headline', '')}
+Texto actual: {cop.get('body', '')}
+Descripción actual: {cop.get('description', '')}
+Correcciones: {changes}
+Devolvé SOLO JSON: {{"headline": "...", "body": "...", "description": "..."}}"""
+            try:
+                result = claude(prompt)
+                m = re.search(r'\{.*\}', result, re.DOTALL)
+                if m: data['copy'] = json.loads(m.group())
+            except Exception: pass
+            cop = data['copy']
+            tg_send(f'📋 *Copy actualizado:*\n\n• Headline: _{cop.get("headline", "")}_\n• Texto: _{cop.get("body", "")}_\n• Descripción: _{cop.get("description", "")}_\n\n_("ok" para crear)_')
+        else:
+            prompt = f"""Ajustá este copy/brief según las correcciones:
 Copy actual: {data.get('copy', '')}
 Brief actual: {data.get('brief_visual', '')}
 Correcciones: {changes}
 Devolvé SOLO JSON: {{"copy": "...", "brief_visual": "..."}}"""
-        try:
-            result = claude(prompt)
-            match = re.search(r'\{.*\}', result, re.DOTALL)
-            if match:
-                adj = json.loads(match.group())
-                data['copy'] = adj.get('copy', data.get('copy'))
-                data['brief_visual'] = adj.get('brief_visual', data.get('brief_visual'))
-        except Exception:
-            pass
-        tg_send(f'📋 *Resumen actualizado*\n\n✍️ *Copy:*\n{data["copy"]}\n\n🎨 *Brief:*\n{data["brief_visual"]}\n\n_("ok" para crear)_')
+            try:
+                result = claude(prompt)
+                match = re.search(r'\{.*\}', result, re.DOTALL)
+                if match:
+                    adj = json.loads(match.group())
+                    data['copy'] = adj.get('copy', data.get('copy'))
+                    data['brief_visual'] = adj.get('brief_visual', data.get('brief_visual'))
+            except Exception: pass
+            tg_send(f'📋 *Resumen actualizado*\n\n✍️ *Copy:*\n{data["copy"]}\n\n🎨 *Brief:*\n{data["brief_visual"]}\n\n_("ok" para crear)_')
         approval['data'] = data
         state['pending_approvals'] = [approval]
         return state
@@ -438,35 +888,110 @@ Devolvé SOLO JSON: {{"copy": "...", "brief_visual": "..."}}"""
             except Exception as e:
                 tg_send(f'❌ Error al crear tarea: {str(e)}')
 
-    elif approval['type'] == 'draft_meta':
+    elif approval['type'] == 'campana_completa':
         data = approval['data']
         client = data['client']
+        account = client['account']
+        page_id = client['page']
+        budget_cents = int(data['presupuesto'] * 100)
+        cop = data['copy']
         try:
-            result = http_req(
-                f'https://graph.facebook.com/v21.0/{client["meta"]}/campaigns',
-                'POST',
-                {'name': data['nombre'], 'objective': data['objetivo'],
-                 'status': 'PAUSED', 'special_ad_categories': [],
-                 'access_token': META_TOKEN}
+            tg_send('⏳ Creando campaña en Meta Ads...')
+            # 1. Campaign
+            camp = http_req(f'https://graph.facebook.com/v21.0/{account}/campaigns', 'POST', {
+                'name': data['nombre'], 'objective': data['objetivo_api'],
+                'status': 'PAUSED', 'special_ad_categories': [], 'access_token': META_TOKEN
+            })
+            campaign_id = camp.get('id')
+            # 2. Ad Set
+            adset = http_req(f'https://graph.facebook.com/v21.0/{account}/adsets', 'POST', {
+                'name': f'{data["nombre"]} — Ad Set',
+                'campaign_id': campaign_id,
+                'daily_budget': budget_cents,
+                'bid_strategy': 'LOWEST_COST_WITHOUT_CAP',
+                'optimization_goal': data['optim_goal'],
+                'billing_event': 'IMPRESSIONS',
+                'targeting': {
+                    'geo_locations': {'countries': [data['country']]},
+                    'age_min': data['age_min'], 'age_max': data['age_max']
+                },
+                'status': 'PAUSED', 'access_token': META_TOKEN
+            })
+            adset_id = adset.get('id')
+            # 3. Creative
+            creative = http_req(f'https://graph.facebook.com/v21.0/{account}/adcreatives', 'POST', {
+                'name': f'{data["nombre"]} — Creative',
+                'object_story_spec': {
+                    'page_id': page_id,
+                    'link_data': {
+                        'image_url': data['imagen'],
+                        'message': cop.get('body', ''),
+                        'link': data['url_destino'],
+                        'name': cop.get('headline', ''),
+                        'description': cop.get('description', ''),
+                        'call_to_action': {'type': data.get('cta_type', 'LEARN_MORE'), 'value': {'link': data['url_destino']}}
+                    }
+                },
+                'access_token': META_TOKEN
+            })
+            creative_id = creative.get('id')
+            # 4. Ad
+            ad = http_req(f'https://graph.facebook.com/v21.0/{account}/ads', 'POST', {
+                'name': f'{data["nombre"]} — Ad',
+                'adset_id': adset_id,
+                'creative': {'creative_id': creative_id},
+                'status': 'PAUSED', 'access_token': META_TOKEN
+            })
+            ad_id = ad.get('id')
+            tg_send(
+                f'✅ *Campaña creada en Meta Ads*\n\n'
+                f'🏢 {client["name"]} — {data["nombre"]}\n\n'
+                f'🆔 Campaign: `{campaign_id}`\n'
+                f'🆔 Ad Set: `{adset_id}`\n'
+                f'🆔 Creative: `{creative_id}`\n'
+                f'🆔 Ad: `{ad_id}`\n\n'
+                f'⏸️ Todo en estado PAUSADO.\n'
+                f'Activá desde Meta Ads cuando el creativo esté listo.'
             )
-            tg_send(f'✅ *Draft creado en Meta Ads*\n\n📋 {data["nombre"]}\n🆔 ID: {result.get("id", "")}\n⏸️ Estado: PAUSADA')
         except Exception as e:
-            tg_send(f'❌ Error al crear draft: {str(e)}')
+            tg_send(f'❌ Error al crear campaña: {str(e)[:200]}')
 
     state['pending_approvals'] = []
     state['active_conversation'] = None
     return state
 
 def h_approve_validar(text, state):
-    task_name = re.sub(r'^ok\s+', '', text, flags=re.IGNORECASE).strip()
+    t_lower = text.lower()
     notified = state.get('notified_validar_tasks', [])
-    task = next((t for t in notified if isinstance(t, dict) and task_name.lower() in t.get('name', '').lower()), None)
+    task = None
+
+    # 1. Formato exacto: "ok [nombre tarea]"
+    if t_lower.startswith('ok '):
+        search = re.sub(r'^ok\s+', '', text, flags=re.IGNORECASE).strip().lower()
+        task = next((t for t in notified if isinstance(t, dict) and search in t.get('name', '').lower()), None)
+
+    # 2. Nombre de la tarea aparece en el mensaje
     if not task:
-        tg_send(f'No encontré la tarea "{task_name}" en los pendientes.')
+        for t in notified:
+            if isinstance(t, dict):
+                name = t.get('name', '').lower()
+                if name and name in t_lower:
+                    task = t
+                    break
+
+    # 3. Solo hay una tarea pendiente → aprobarla directamente
+    if not task and len([t for t in notified if isinstance(t, dict)]) == 1:
+        task = next(t for t in notified if isinstance(t, dict))
+
+    if not task:
+        pending = '\n'.join(f'• {t["name"]}' for t in notified if isinstance(t, dict))
+        tg_send(f'No identifiqué qué tarea aprobar. Pendientes:\n{pending or "Ninguna"}')
         return state
+
     try:
         cu_put(f'task/{task["task_id"]}', {'status': task.get('done_status', 'done')})
         tg_send(f'✅ *{task["name"]}* marcada como {task.get("done_status", "done")}.')
+        state['notified_validar_tasks'] = [t for t in notified if t.get('task_id') != task['task_id']]
     except Exception as e:
         tg_send(f'❌ Error: {str(e)}')
     return state
@@ -474,7 +999,7 @@ def h_approve_validar(text, state):
 def h_correct_validar(text, state):
     match = re.match(r'correcciones\s+(.+?):\s*(.+)', text, re.IGNORECASE | re.DOTALL)
     if not match:
-        tg_send('Formato: "correcciones [nombre tarea]: [descripción]"')
+        tg_send('Formato: correcciones NOMBRE DE TAREA: descripcion de los cambios')
         return state
     task_name, corrections = match.group(1).strip(), match.group(2).strip()
     notified = state.get('notified_validar_tasks', [])
@@ -720,7 +1245,70 @@ _Últimos 90 días · Meta Ads_
 
     return state
 
+SOFIA_CLICKUP_EMAIL = 'sofia.colombo@tivenos.com'
+
+# --- Social accounts ---
+SOCIAL_ACCOUNTS = [
+    {'client': 'Behind-U',  'fb': '329482500949627',  'ig': '17841409037631007', 'li': '33294267'},
+    {'client': 'EBDS',      'fb': '102439669276120',  'ig': '17841455358314149', 'li': '81972160'},
+    {'client': 'Sibila',    'fb': '100075997488468',  'ig': '50607705062',       'li': '77605671'},
+    {'client': 'ZoWeAre',   'fb': '933257013195402',  'ig': '17841479150682279', 'li': '110340230'},
+    {'client': 'Tivenos',   'fb': '100077396560752',   'ig': '52254063803',       'li': '9256248'},
+]
+
+# ─── CONTENT CALENDAR ───────────────────────────────────────────────
+CALENDAR_BRANDS = ['EBDS', 'Sibila', 'ZoWeAre', 'Tivenos', 'BHU']
+
+BRAND_CONTEXT = {
+    'EBDS': """European Business & Digital School. Posgrados y masters online con titulación propia y europea. Audiencia: profesionales 25-45 que quieren escalar en tecnología, gestión, diseño y negocios digitales. Tono: aspiracional, educativo, profesional. Pilares: programas académicos (MBA Digital, Data Analytics, UX/UI, Marketing Digital, Gestión de Proyectos, Inteligencia Artificial), empleabilidad, casos de éxito de alumnos, innovación digital, tips profesionales.
+Estilo de copies: directo, usa flechas → para listar beneficios, emojis moderados (1-2 por bloque), frases cortas e impactantes, siempre termina con CTA al link de la bio y 3-5 hashtags. Hashtags frecuentes: #EBDS #FormaciónOnline #DesarrolloProfesional #TransformaciónDigital #MBADigital
+Web: ebds.online""",
+    'Sibila': """Sibila: plataforma omnicanal de comunicación empresarial con IA (WhatsApp Business, Email, SMS, chatbots y más, desde una sola interfaz). Audiencia: gerentes y responsables de atención al cliente en empresas medianas/grandes que quieren modernizar cómo se comunican con sus clientes y mejorar tiempos de respuesta. Tono: innovador, confiable, tecnológico pero cercano. Pilares: funcionalidades de la plataforma, casos de uso reales, ROI/eficiencia operativa, integraciones con otros sistemas, atención omnicanal con IA.
+Estilo de copies: enfocado en el problema del cliente (comunicación dispersa, lentitud), luego la solución (Sibila centraliza todo), siempre con dato o beneficio concreto. Emojis moderados. CTA al link de la bio. Hashtags: #Sibila #AtenciónAlCliente #Omnicanal #IA #Chatbot #CX
+Web: sibila.app""",
+    'ZoWeAre': """ZoWeAre: empresa de transformación digital, Advanced Partner certificado de Zoho. Implementan CRM, ERP, automatización de procesos y soluciones a medida con la suite Zoho. Audiencia: dueños y directores de empresas medianas que quieren digitalizar sus operaciones, dejar de usar hojas de cálculo y tener visibilidad total del negocio. Tono: experto pero accesible, orientado a resultados, práctico.
+Pilares: casos de éxito con resultados medibles, herramientas Zoho (CRM, Books, Projects, Marketing Hub), metodología de implementación, ROI digital, problemas comunes que resuelven.
+Estilo de copies: antes/después o problema/solución, datos concretos de ahorro de tiempo o aumento de ventas, CTA a consulta gratuita. Hashtags: #ZoWeAre #Zoho #TransformaciónDigital #CRM #AutomatizaciónDeProcesos #ERP
+Web: zoweare.com""",
+    'Tivenos': """Tivenos: empresa de tecnología y transformación digital. Desarrollo de software a medida, consultoría tech e integración de sistemas. Audiencia: empresas que necesitan soluciones tecnológicas hechas a su medida porque los productos genéricos no les alcanzan. Tono: profesional, innovador, confiable, orientado a resultados.
+Pilares: proyectos de desarrollo a medida, consultoría tecnológica, integración de sistemas, metodología ágil, casos de éxito con impacto en el negocio.
+Estilo de copies: enfocado en el problema técnico del cliente y cómo Tivenos lo resuelve con precisión, sin tecnicismos innecesarios. CTA a conversación inicial. Hashtags: #Tivenos #DesarrolloSoftware #TechConsulting #TransformaciónDigital #SoftwareAMedida
+Web: tivenos.com""",
+    'BHU': """Behind-U / UIN: institución educativa con programas online de grado y posgrado. Audiencia: jóvenes y adultos que buscan formación universitaria flexible, accesible desde cualquier lugar. Tono: motivacional, cercano, inclusivo, esperanzador. Pilares: programas disponibles, modalidad 100% online, acompañamiento personalizado, historias de alumnos que lograron sus metas, precio accesible, titulación válida.
+Estilo de copies: emotivo y directo, habla de sueños y oportunidades, celebra el logro de estudiar siendo adulto o con vida laboral. CTA a inscribirse o conocer programas. Hashtags: #BehindU #UIN #EducaciónOnline #FormaciónProfesional #EstudiaOnline
+Web: behind-u.net""",
+}
+
+CALENDAR_BRAND_COLORS = {
+    'EBDS': '#1e3a8a', 'Sibila': '#7c3aed', 'ZoWeAre': '#059669',
+    'Tivenos': '#dc2626', 'BHU': '#d97706',
+}
+CALENDAR_TYPE_COLORS = {
+    'Reel': '#16a34a', 'Carrusel': '#9333ea', 'Post': '#2563eb',
+    'LinkedIn': '#0284c7', 'Blog': '#ea580c', 'Email': '#dc2626',
+}
+
+# Rotation pattern: each row = one posting day, each column = brand index
+# Rules: max 1 Reel/day, max 1 Carrusel/day
+CALENDAR_FORMAT_ROTATION = [
+    ['Carrusel', 'Post',     'Post',     'Reel',     'Post'],
+    ['Reel',     'Post',     'Carrusel', 'Post',     'Post'],
+    ['Post',     'Carrusel', 'Reel',     'Post',     'Post'],
+    ['Post',     'Reel',     'Post',     'Carrusel', 'Post'],
+    ['Carrusel', 'Post',     'Post',     'Reel',     'Post'],
+    ['Reel',     'Post',     'Carrusel', 'Post',     'Post'],
+    ['Post',     'Carrusel', 'Reel',     'Post',     'Post'],
+    ['Post',     'Post',     'Reel',     'Post',     'Carrusel'],
+    ['Reel',     'Carrusel', 'Post',     'Post',     'Post'],
+    ['Post',     'Post',     'Post',     'Carrusel', 'Reel'],
+    ['Carrusel', 'Reel',     'Post',     'Post',     'Post'],
+    ['Post',     'Post',     'Carrusel', 'Reel',     'Post'],
+    ['Reel',     'Post',     'Post',     'Post',     'Carrusel'],
+]
+
 def check_validar(state):
+    if dt.date.today().weekday() >= 5:  # sábado=5, domingo=6
+        return state
     seen = notified_ids(state)
     for ws_id, ws_info in WORKSPACES.items():
         try:
@@ -729,9 +1317,18 @@ def check_validar(state):
                 task_id = task.get('id')
                 if task_id in seen:
                     continue
+                # Notificar todas las tareas en validar (sin filtro de assignee)
+                # — son tareas de diseño de Stefania que Sofia debe revisar
                 comments = cu_get(f'task/{task_id}/comment').get('comments', [])
                 last_comment = comments[-1].get('comment_text', '') if comments else ''
-                wd_match = re.search(r'https?://\S*zoho\S+', last_comment)
+                task_desc = task.get('description', '') or ''
+                # Buscar link WorkDrive/Zoho en comentarios y descripción
+                search_text = last_comment + ' ' + task_desc
+                wd_match = re.search(r'https?://\S*(?:workdrive|zohoexternal|zoho)\S+', search_text)
+                if not wd_match:
+                    # También buscar en todos los comentarios
+                    all_comments_text = ' '.join(c.get('comment_text','') for c in comments)
+                    wd_match = re.search(r'https?://\S*(?:workdrive|zohoexternal|zoho)\S+', all_comments_text)
                 wd_link = wd_match.group() if wd_match else 'No hay link de archivos'
                 task_name = task.get('name', '')
                 tg_send(
@@ -741,8 +1338,8 @@ def check_validar(state):
                     f'💬 Comentario: "{last_comment[:200] or "Sin comentarios"}"\n'
                     f'🔗 ClickUp: {task.get("url", "")}\n'
                     f'📂 Archivos: {wd_link}\n\n'
-                    f'¿La aprobás o tiene correcciones?\n'
-                    f'_("ok {task_name}" para aprobar | "correcciones {task_name}: [desc]" para corregir)_'
+                    f'Responde *ok {task_name}* para aprobar\n'
+                    f'o *correcciones {task_name}: tu descripcion* para pedir cambios'
                 )
                 state['notified_validar_tasks'].append({
                     'task_id': task_id, 'name': task_name,
@@ -768,37 +1365,2822 @@ def process(text, state):
         'projection':    h_projection,
         'draft_meta':    h_draft_meta,
         'brand_eval':    h_brand_eval,
+        'calendar':      h_calendar,
+        'regen_post':    h_regen_post,
+        'crm_report':    h_crm_report,
+        'paid_report':   h_paid_report,
     }
     if intent in handlers:
         return handlers[intent](text, state)
     tg_send('No entendí bien. ¿Qué necesitás?\n\n1️⃣ Análisis de campañas\n2️⃣ Crear tarea para Stefania\n3️⃣ Proyección de campaña\n4️⃣ Research de competencia\n5️⃣ Redactar copies\n6️⃣ Tendencias Meta/Google\n7️⃣ Crear draft en Meta Ads\n8️⃣ Evaluación de marca')
     return state
 
-# --- Vercel handler ---
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'OK')
+# ─────────────────────────────────────────────
+# SEO / AEO MONTHLY REPORT
+# ─────────────────────────────────────────────
+GOOGLE_CLIENT_ID     = '75867073584-qof2qcdtmcppgookbkft3qvp8gp4vnq6.apps.googleusercontent.com'
+GOOGLE_CLIENT_SECRET = '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'
+GOOGLE_REFRESH_TOKEN = '1//0hRZcfML6JUGyCgYIARAAGBESNwF-L9IrnL5pqeyZCiUwUi68SMdFT3OvFCyzH9N8G-WEnQCSfFRBfhb3rV3S_b-QC--pW2ohw3Q'
+
+SEO_CLIENTS = [
+    {'name': 'EBDS',    'url': 'https://ebds.online',  'sc_url': 'sc-domain:ebds.online',  'ga4': '426749533'},
+    {'name': 'Sibila',  'url': 'https://sibila.app',   'sc_url': 'sc-domain:sibila.app',   'ga4': '426775519'},
+    {'name': 'Tivenos', 'url': 'https://tivenos.com',  'sc_url': 'sc-domain:tivenos.com',  'ga4': '438322787'},
+    {'name': 'BehindU', 'url': 'https://behind-u.net', 'sc_url': 'sc-domain:behind-u.net', 'ga4': '420486833'},
+    {'name': 'ZoWeAre',      'url': 'https://zoweare.com',      'sc_url': None,                          'ga4': '521287190'},
+    {'name': 'Pediapartner', 'url': 'https://pediapartner.com', 'sc_url': None,                          'ga4': '456852321'},
+]
+
+def is_first_business_day():
+    today = dt.date.today()
+    day = today.replace(day=1)
+    while day.weekday() >= 5:
+        day += dt.timedelta(days=1)
+    return day == today
+
+def get_google_token():
+    data = urllib.parse.urlencode({
+        'client_id': GOOGLE_CLIENT_ID,
+        'client_secret': GOOGLE_CLIENT_SECRET,
+        'refresh_token': GOOGLE_REFRESH_TOKEN,
+        'grant_type': 'refresh_token'
+    }).encode()
+    req = urllib.request.Request('https://oauth2.googleapis.com/token', data=data)
+    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    return resp.get('access_token')
+
+def sc_query(token, site_url, start, end, dimensions=None, row_limit=15):
+    encoded = urllib.parse.quote(site_url, safe='')
+    url = f'https://www.googleapis.com/webmasters/v3/sites/{encoded}/searchAnalytics/query'
+    body = {'startDate': start, 'endDate': end, 'rowLimit': row_limit}
+    if dimensions:
+        body['dimensions'] = dimensions
+    req = urllib.request.Request(url,
+        data=json.dumps(body).encode(),
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
+    return json.loads(urllib.request.urlopen(req, timeout=12).read())
+
+def get_sc_data(token, site_url):
+    today = dt.date.today()
+    e1 = today.replace(day=1) - dt.timedelta(days=1)
+    s1 = e1.replace(day=1)
+    e2 = s1 - dt.timedelta(days=1)
+    s2 = e2.replace(day=1)
+    month_label = s1.strftime('%B %Y')
+
+    def safe(fn):
+        try: return fn()
+        except: return {}
+
+    overall_cur  = safe(lambda: sc_query(token, site_url, s1.isoformat(), e1.isoformat()))
+    overall_prev = safe(lambda: sc_query(token, site_url, s2.isoformat(), e2.isoformat()))
+    keywords     = safe(lambda: sc_query(token, site_url, s1.isoformat(), e1.isoformat(), ['query'], 15))
+    pages        = safe(lambda: sc_query(token, site_url, s1.isoformat(), e1.isoformat(), ['page'], 10))
+    opps_raw     = safe(lambda: sc_query(token, site_url, s1.isoformat(), e1.isoformat(), ['query'], 200))
+
+    def row0(r): return r.get('rows', [{}])[0] if r.get('rows') else {}
+    cur  = row0(overall_cur)
+    prev = row0(overall_prev)
+
+    def delta(a, b, key):
+        av, bv = a.get(key, 0), b.get(key, 0)
+        if bv: return f'{((av-bv)/bv*100):+.0f}%'
+        return 'N/A'
+
+    opp_rows = [r for r in opps_raw.get('rows', [])
+                if r.get('impressions', 0) > 50 and r.get('ctr', 1) < 0.03 and r.get('position', 99) < 20]
+    opp_rows.sort(key=lambda x: -x.get('impressions', 0))
+
+    return {
+        'month': month_label,
+        'clicks':      cur.get('clicks', 0),
+        'impressions': cur.get('impressions', 0),
+        'ctr':         cur.get('ctr', 0) * 100,
+        'position':    cur.get('position', 0),
+        'd_clicks':    delta(cur, prev, 'clicks'),
+        'd_impressions': delta(cur, prev, 'impressions'),
+        'd_ctr':       delta(cur, prev, 'ctr'),
+        'd_position':  delta(cur, prev, 'position'),
+        'keywords':    keywords.get('rows', [])[:10],
+        'pages':       pages.get('rows', [])[:10],
+        'opps':        opp_rows[:5],
+    }
+
+def get_ga4_data(token, property_id):
+    today = dt.date.today()
+    e1 = today.replace(day=1) - dt.timedelta(days=1)
+    s1 = e1.replace(day=1)
+    e2 = s1 - dt.timedelta(days=1)
+    s2 = e2.replace(day=1)
+
+    url = f'https://analyticsdata.googleapis.com/v1beta/properties/{property_id}:runReport'
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    def ga4_req(body):
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+        return json.loads(urllib.request.urlopen(req, timeout=12).read())
+
+    def val(resp, metric_idx=0, row_idx=0):
         try:
-            length = int(self.headers.get('Content-Length', 0))
-            body = json.loads(self.rfile.read(length))
-            msg = body.get('message', {})
-            if not msg or msg.get('chat', {}).get('id') != SOFIA_CHAT_ID:
-                return
-            text = msg.get('text', '').strip()
-            if not text:
-                return
-            state = read_state()
-            state = process(text, state)
-            save_state(state)
-        except Exception as e:
-            print(f'Error: {e}')
+            return float(resp['rows'][row_idx]['metricValues'][metric_idx]['value'])
+        except: return 0.0
 
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'Marketing Agent Bot running!')
+    def delta(a, b):
+        return f'{((a-b)/b*100):+.0f}%' if b else 'N/A'
 
-    def log_message(self, format, *args):
+    # Métricas globales mes anterior vs mes anterior anterior
+    body_cur = {
+        'dateRanges': [{'startDate': s1.isoformat(), 'endDate': e1.isoformat()}],
+        'metrics': [
+            {'name': 'sessions'}, {'name': 'totalUsers'},
+            {'name': 'engagementRate'}, {'name': 'averageSessionDuration'},
+            {'name': 'conversions'}
+        ]
+    }
+    body_prev = {
+        'dateRanges': [{'startDate': s2.isoformat(), 'endDate': e2.isoformat()}],
+        'metrics': [{'name': 'sessions'}, {'name': 'totalUsers'}]
+    }
+    # Canales de tráfico
+    body_channels = {
+        'dateRanges': [{'startDate': s1.isoformat(), 'endDate': e1.isoformat()}],
+        'dimensions': [{'name': 'sessionDefaultChannelGroup'}],
+        'metrics': [{'name': 'sessions'}],
+        'orderBys': [{'metric': {'metricName': 'sessions'}, 'desc': True}],
+        'limit': 6
+    }
+
+    try: r_cur = ga4_req(body_cur)
+    except: r_cur = {}
+    try: r_prev = ga4_req(body_prev)
+    except: r_prev = {}
+    try: r_ch = ga4_req(body_channels)
+    except: r_ch = {}
+
+    sessions_cur  = val(r_cur, 0)
+    users_cur     = val(r_cur, 1)
+    eng_rate      = val(r_cur, 2) * 100
+    avg_duration  = val(r_cur, 3)
+    conversions   = val(r_cur, 4)
+    sessions_prev = val(r_prev, 0)
+    users_prev    = val(r_prev, 1)
+
+    channels = []
+    for row in r_ch.get('rows', []):
+        ch_name = row['dimensionValues'][0]['value']
+        ch_sess = float(row['metricValues'][0]['value'])
+        channels.append((ch_name, int(ch_sess)))
+
+    mins = int(avg_duration // 60)
+    secs = int(avg_duration % 60)
+
+    return {
+        'month':        s1.strftime('%B %Y'),
+        'sessions':     int(sessions_cur),
+        'users':        int(users_cur),
+        'eng_rate':     eng_rate,
+        'avg_duration': f'{mins}m {secs}s',
+        'conversions':  int(conversions),
+        'd_sessions':   delta(sessions_cur, sessions_prev),
+        'd_users':      delta(users_cur, users_prev),
+        'channels':     channels,
+    }
+
+def get_pagespeed(url):
+    api = (f'https://www.googleapis.com/pagespeedonline/v5/runPagespeed'
+           f'?url={urllib.parse.quote(url, safe="")}&strategy=mobile'
+           f'&category=performance&category=seo')
+    data = json.loads(urllib.request.urlopen(api, timeout=20).read())
+    cats   = data.get('lighthouseResult', {}).get('categories', {})
+    audits = data.get('lighthouseResult', {}).get('audits', {})
+    perf = int(cats.get('performance', {}).get('score', 0) * 100)
+    seo  = int(cats.get('seo',         {}).get('score', 0) * 100)
+    lcp  = audits.get('largest-contentful-paint', {}).get('displayValue', 'N/A')
+    cls_ = audits.get('cumulative-layout-shift',  {}).get('displayValue', 'N/A')
+    tbt  = audits.get('total-blocking-time',       {}).get('displayValue', 'N/A')
+    fcp  = audits.get('first-contentful-paint',    {}).get('displayValue', 'N/A')
+    opps = [(a.get('title', ''), a.get('details', {}).get('overallSavingsMs', 0))
+            for a in audits.values()
+            if a.get('score') is not None and a.get('score', 1) < 0.9 and a.get('title')]
+    opps.sort(key=lambda x: -x[1])
+    return {'perf': perf, 'seo': seo, 'lcp': lcp, 'cls': cls_, 'tbt': tbt, 'fcp': fcp,
+            'opps': [o[0] for o in opps[:3]]}
+
+def crawl_seo(url):
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; SEOBot/1.0)'})
+    html = urllib.request.urlopen(req, timeout=12).read().decode('utf-8', errors='ignore')
+
+    def rx(pattern, default='AUSENTE'):
+        m = re.search(pattern, html, re.I | re.S)
+        return m.group(1).strip() if m else default
+
+    title = rx(r'<title[^>]*>(.*?)</title>')
+    desc  = rx(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)')
+    if desc == 'AUSENTE':
+        desc = rx(r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+name=["\']description')
+    h1s   = [re.sub(r'<[^>]+>', '', h).strip() for h in re.findall(r'<h1[^>]*>(.*?)</h1>', html, re.I|re.S)]
+    h2s   = re.findall(r'<h2[^>]*>(.*?)</h2>', html, re.I|re.S)
+    can   = rx(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)')
+    ld    = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I|re.S)
+    schemas = []
+    for s in ld:
+        m = re.search(r'"@type"\s*:\s*"([^"]+)"', s)
+        if m: schemas.append(m.group(1))
+    og_t  = rx(r'property=["\']og:title["\'][^>]+content=["\']([^"\']*)')
+    og_i  = bool(re.search(r'property=["\']og:image["\']', html, re.I))
+    all_h = [re.sub(r'<[^>]+>', '', h).strip() for h in re.findall(r'<h[2-4][^>]*>(.*?)</h[2-4]>', html, re.I|re.S)]
+    q_h   = [h for h in all_h if '?' in h]
+
+    def head_ok(path):
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(url.rstrip('/')+path, method='HEAD'), timeout=5)
+            return r.status < 400
+        except: return False
+
+    return {
+        'title': title, 'title_len': len(title),
+        'desc': desc,   'desc_len': len(desc),
+        'h1s': h1s, 'h2_count': len(h2s),
+        'canonical': can,
+        'schemas': schemas,
+        'has_faq': 'FAQPage' in schemas,
+        'has_howto': 'HowTo' in schemas,
+        'og_title': og_t, 'og_image': og_i,
+        'q_headings': len(q_h),
+        'sitemap': head_ok('/sitemap.xml'),
+        'robots': head_ok('/robots.txt'),
+    }
+
+def sem(value, good, ok):
+    return '🟢' if value <= good else ('🟡' if value <= ok else '🔴')
+
+def sem_score(s):
+    return '🟢' if s >= 90 else ('🟡' if s >= 50 else '🔴')
+
+def build_seo_report(client_name, ps, tech, sc, ga4=None):
+    # --- Performance section ---
+    lcp_num = float(re.sub(r'[^\d.]', '', ps['lcp']) or 9) if ps else 9
+    cls_num = float(re.sub(r'[^\d.]', '', ps['cls']) or 9) if ps else 9
+    tbt_num = float(re.sub(r'[^\d.]', '', ps['tbt']) or 999) if ps else 999
+
+    perf_block = ''
+    if ps:
+        perf_block = (
+            f"\n⚡ *PERFORMANCE (mobile)*\n"
+            f"• Score: {ps['perf']}/100 {sem_score(ps['perf'])}\n"
+            f"• LCP: {ps['lcp']} {sem(lcp_num, 2.5, 4.0)}\n"
+            f"• CLS: {ps['cls']} {sem(cls_num, 0.1, 0.25)}\n"
+            f"• TBT: {ps['tbt']} {sem(tbt_num, 200, 600)}\n"
+            f"• FCP: {ps['fcp']}\n"
+            f"• SEO Lighthouse: {ps['seo']}/100\n"
+        )
+
+    # --- Technical section ---
+    t_title  = '🟢' if 50 <= tech['title_len'] <= 60 else '🟡'
+    t_desc   = '🟢' if 140 <= tech['desc_len'] <= 165 else ('🔴' if tech['desc'] == 'AUSENTE' else '🟡')
+    t_h1     = '🟢' if len(tech['h1s']) == 1 else '🔴'
+    schemas_str = ', '.join(tech['schemas']) if tech['schemas'] else 'Ninguno'
+    aeo_score = 'Rico' if len(tech['schemas']) >= 3 else ('Básico' if tech['schemas'] else 'Vacío')
+
+    tech_block = (
+        f"\n🔍 *SEO TÉCNICO*\n"
+        f"• Title: _{tech['title'][:50]}_ ({tech['title_len']} chars) {t_title}\n"
+        f"• Meta desc: {tech['desc_len']} chars {t_desc}\n"
+        f"• H1: {len(tech['h1s'])} {t_h1}"
+        + (f" — _{tech['h1s'][0][:40]}_" if tech['h1s'] else '') + "\n"
+        f"• H2s: {tech['h2_count']} | Canonical: {'✅' if tech['canonical'] != 'AUSENTE' else '❌'}\n"
+        f"• Schema.org: {schemas_str}\n"
+        f"• Sitemap: {'✅' if tech['sitemap'] else '❌'} | Robots: {'✅' if tech['robots'] else '❌'}\n"
+        f"• OG tags: {'OK' if tech['og_image'] else 'Sin imagen'}\n"
+        f"\n🤖 *AEO — Optimización para IA*\n"
+        f"• FAQ schema: {'✅' if tech['has_faq'] else '❌'}\n"
+        f"• HowTo schema: {'✅' if tech['has_howto'] else '❌'}\n"
+        f"• Encabezados-pregunta: {tech['q_headings']}\n"
+        f"• Structured data: {aeo_score}\n"
+    )
+
+    # --- Search Console section ---
+    sc_block = ''
+    if sc:
+        kw_lines = '\n'.join(
+            f"  `{r['keys'][0][:35]}` {r['clicks']:.0f} clics · pos {r['position']:.1f}"
+            for r in sc['keywords'][:5]
+        ) or '  Sin datos'
+        opp_lines = '\n'.join(
+            f"  `{r['keys'][0][:35]}` {r['impressions']:.0f} impr · CTR {r['ctr']*100:.1f}% · pos {r['position']:.1f}"
+            for r in sc['opps'][:3]
+        ) or '  Sin oportunidades detectadas'
+        sc_block = (
+            f"\n📈 *SEARCH CONSOLE — {sc['month']}*\n"
+            f"• Clics: {sc['clicks']:.0f} ({sc['d_clicks']})\n"
+            f"• Impresiones: {sc['impressions']:.0f} ({sc['d_impressions']})\n"
+            f"• CTR: {sc['ctr']:.1f}% ({sc['d_ctr']})\n"
+            f"• Posición media: {sc['position']:.1f} ({sc['d_position']})\n"
+            f"\n🔑 *Top keywords:*\n{kw_lines}\n"
+            f"\n💡 *Oportunidades (alta impr, bajo CTR):*\n{opp_lines}\n"
+        )
+    else:
+        sc_block = "\n📈 *SEARCH CONSOLE*\n_Sin Search Console configurado_\n"
+
+    # --- GA4 section ---
+    ga4_block = ''
+    if ga4:
+        ch_lines = '\n'.join(f"  • {ch}: {n:,} sesiones" for ch, n in ga4['channels'][:5]) or '  Sin datos'
+        eng_icon = '🟢' if ga4['eng_rate'] >= 60 else ('🟡' if ga4['eng_rate'] >= 40 else '🔴')
+        ga4_block = (
+            f"\n📊 *ANALYTICS — {ga4['month']}*\n"
+            f"• Sesiones: {ga4['sessions']:,} ({ga4['d_sessions']})\n"
+            f"• Usuarios: {ga4['users']:,} ({ga4['d_users']})\n"
+            f"• Engagement rate: {ga4['eng_rate']:.1f}% {eng_icon}\n"
+            f"• Duración media: {ga4['avg_duration']}\n"
+            + (f"• Conversiones: {ga4['conversions']:,}\n" if ga4['conversions'] else '')
+            + f"\n🌐 *Canales de tráfico:*\n{ch_lines}\n"
+        )
+
+    # --- Acciones with Claude ---
+    prompt = f"""Sos experta en SEO y AEO. Generá 5 acciones prioritarias ordenadas por impacto para {client_name}.
+
+Datos disponibles:
+- Performance mobile: score {ps['perf'] if ps else 'N/A'}, LCP {ps['lcp'] if ps else 'N/A'}, TBT {ps['tbt'] if ps else 'N/A'}
+- Title: {tech['title_len']} chars {'(OK)' if 50 <= tech['title_len'] <= 60 else '(fuera de rango)'}
+- Meta desc: {tech['desc_len']} chars {'(OK)' if 140 <= tech['desc_len'] <= 165 else '(fuera de rango)'}
+- H1: {len(tech['h1s'])} {'(OK)' if len(tech['h1s']) == 1 else '(problema)'}
+- Schemas: {tech['schemas'] or 'ninguno'}
+- FAQ schema: {'sí' if tech['has_faq'] else 'NO'}
+- Sitemap: {'OK' if tech['sitemap'] else 'NO EXISTE'}
+{'- Clics SC: ' + str(int(sc['clicks'])) + ' (' + sc['d_clicks'] + ')' if sc else ''}
+{'- Sesiones GA4: ' + str(ga4['sessions']) + ' (' + ga4['d_sessions'] + '), eng: ' + str(round(ga4['eng_rate'])) + '%' if ga4 else ''}
+{'- Oportunidades top: ' + (sc['opps'][0]['keys'][0] if sc and sc['opps'] else 'ninguna') if sc else ''}
+
+Devolvé SOLO JSON: {{"acciones": ["[ALTO] acción concreta 1", "[ALTO] acción concreta 2", "[MEDIO] acción 3", "[MEDIO] acción 4", "[BAJO] acción 5"]}}
+Cada acción: específica, máx 80 chars, en español, sin genéricos."""
+
+    acciones = ['Error al generar acciones'] * 5
+    try:
+        r = claude(prompt)
+        m = re.search(r'\{.*\}', r, re.DOTALL)
+        if m:
+            acciones = json.loads(m.group()).get('acciones', acciones)
+    except Exception:
         pass
+
+    actions_block = "\n🎯 *5 ACCIONES PRIORITARIAS*\n" + '\n'.join(f"{i+1}. {a}" for i, a in enumerate(acciones[:5]))
+
+    header = f"📊 *REPORTE SEO/AEO — {client_name}*\n📅 {dt.date.today().strftime('%d/%m/%Y')} | 🌐 {client_name.lower()}"
+    return header + ga4_block + sc_block + perf_block + tech_block + actions_block
+
+def generate_paid_media_pdf(client_name, meta_campaigns, crm_funnel=None, level='campaign'):
+    """PDF de reporte paid media + CRM. Estilo dashboard: portada, KPIs, funnel, campañas."""
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+
+    C_DARK   = (15, 23, 42)    # slate-900
+    C_BLUE   = (37, 99, 235)   # blue-600
+    C_LIGHT  = (241, 245, 249) # slate-100
+    C_WHITE  = (255, 255, 255)
+    C_GRAY   = (100, 116, 139) # slate-500
+    C_GREEN  = (22, 163, 74)   # green-600
+    C_ORANGE = (234, 88, 12)   # orange-600
+    C_RED    = (220, 38, 38)   # red-600
+
+    def safe(s):
+        return str(s or '').encode('latin-1', 'replace').decode('latin-1')
+
+    def row(pdf, h, txt, bold=False, color=None, size=10):
+        pdf.set_font('Helvetica', 'B' if bold else '', size)
+        if color:
+            pdf.set_text_color(*color)
+        pdf.multi_cell(0, h, safe(txt), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    def section_header(pdf, title):
+        pdf.ln(4)
+        pdf.set_fill_color(*C_BLUE)
+        pdf.set_text_color(*C_WHITE)
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.cell(0, 8, f'  {safe(title)}', fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_text_color(*C_DARK)
+        pdf.ln(2)
+
+    def kpi_card(pdf, x, y, w, label, value, sub='', color=C_BLUE):
+        pdf.set_fill_color(*C_LIGHT)
+        pdf.rect(x, y, w, 22, 'F')
+        pdf.set_fill_color(*color)
+        pdf.rect(x, y, 3, 22, 'F')
+        pdf.set_xy(x + 5, y + 3)
+        pdf.set_font('Helvetica', 'B', 14)
+        pdf.set_text_color(*color)
+        pdf.cell(w - 8, 7, safe(str(value)))
+        pdf.set_xy(x + 5, y + 11)
+        pdf.set_font('Helvetica', '', 8)
+        pdf.set_text_color(*C_GRAY)
+        pdf.cell(w - 8, 5, safe(label))
+        if sub:
+            pdf.set_xy(x + 5, y + 16)
+            pdf.set_font('Helvetica', '', 7)
+            pdf.cell(w - 8, 5, safe(sub))
+
+    def funnel_bar(pdf, label, value, total, color=C_BLUE):
+        pct = (value / total * 100) if total else 0
+        bar_w = 90
+        fill_w = max(2, bar_w * pct / 100)
+        y = pdf.get_y()
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(*C_DARK)
+        pdf.cell(55, 7, safe(label))
+        pdf.set_fill_color(*C_LIGHT)
+        pdf.rect(pdf.get_x(), y + 1, bar_w, 5, 'F')
+        pdf.set_fill_color(*color)
+        pdf.rect(pdf.get_x(), y + 1, fill_w, 5, 'F')
+        pdf.set_x(pdf.get_x() + bar_w + 3)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.cell(20, 7, f'{value}  ({pct:.0f}%)')
+        pdf.ln(8)
+
+    # ─── Aggregate Meta data ───────────────────────────────────────────
+    total_spend   = sum(float(c.get('spend', 0)) for c in meta_campaigns)
+    total_clicks  = sum(int(c.get('clicks', 0)) for c in meta_campaigns)
+    total_impr    = sum(int(c.get('impressions', 0)) for c in meta_campaigns)
+    total_leads   = 0
+    for c in meta_campaigns:
+        for a in c.get('actions', []) or []:
+            if a.get('action_type') in ('lead', 'onsite_conversion.lead_grouped'):
+                total_leads += int(a.get('value', 0))
+    cpl  = round(total_spend / total_leads, 2) if total_leads else 0
+    ctr  = round(total_clicks / total_impr * 100, 2) if total_impr else 0
+    cpm  = round(total_spend / total_impr * 1000, 2) if total_impr else 0
+
+    today_str = dt.date.today().strftime('%d/%m/%Y')
+    filepath  = f'/tmp/reporte_paid_{client_name.replace("/","_").replace(" ","_")}_{dt.date.today()}.pdf'
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(18, 18, 18)
+
+    # ─── PORTADA ──────────────────────────────────────────────────────
+    pdf.add_page()
+    pdf.set_fill_color(*C_DARK)
+    pdf.rect(0, 0, 210, 297, 'F')
+    # Accent bar
+    pdf.set_fill_color(*C_BLUE)
+    pdf.rect(0, 120, 210, 4, 'F')
+    pdf.set_text_color(*C_WHITE)
+    pdf.set_font('Helvetica', 'B', 36)
+    pdf.set_y(65)
+    pdf.cell(0, 18, 'PAID MEDIA', align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font('Helvetica', 'B', 28)
+    pdf.cell(0, 14, 'REPORT', align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_y(132)
+    pdf.set_font('Helvetica', 'B', 18)
+    pdf.set_text_color(147, 197, 253)  # blue-300
+    pdf.cell(0, 10, safe(client_name), align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font('Helvetica', '', 12)
+    pdf.set_text_color(148, 163, 184)  # slate-400
+    pdf.cell(0, 8, 'Ultimos 30 dias   |   Meta Ads' + (' + CRM' if crm_funnel else ''), align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_y(260)
+    pdf.set_font('Helvetica', '', 10)
+    pdf.cell(0, 6, f'Generado: {today_str}   |   Marketing Agent Bot', align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # ─── PÁGINA 1: KPIs + CAMPAÑAS ────────────────────────────────────
+    pdf.add_page()
+    pdf.set_text_color(*C_DARK)
+
+    # KPI cards row 1
+    section_header(pdf, 'KPIs GLOBALES — ULTIMOS 30 DIAS')
+    y0 = pdf.get_y()
+    card_w = 39
+    gap = 3
+    kpi_card(pdf, 18,          y0, card_w, 'Gasto total',  f'${total_spend:,.0f}',  'USD',          C_BLUE)
+    kpi_card(pdf, 18+card_w+gap, y0, card_w, 'Leads Meta',   str(total_leads),       'ultimos 30d',  C_GREEN)
+    kpi_card(pdf, 18+(card_w+gap)*2, y0, card_w, 'CPL',       f'${cpl:,.2f}',         'costo por lead', C_ORANGE)
+    kpi_card(pdf, 18+(card_w+gap)*3, y0, card_w, 'CTR',       f'{ctr:.2f}%',          f'CPM ${cpm:.2f}', C_BLUE)
+    pdf.set_y(y0 + 28)
+
+    # Campaigns / Adsets table
+    is_adset = (level == 'adset')
+    section_header(pdf, 'DETALLE POR CONJUNTO DE ANUNCIO' if is_adset else 'DETALLE POR CAMPANA')
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_fill_color(*C_LIGHT)
+    pdf.set_text_color(*C_GRAY)
+    col_label = 'Conjunto de anuncio' if is_adset else 'Campana'
+    cols = [(col_label, 78), ('Gasto', 22), ('Leads', 18), ('CPL', 22), ('CTR', 18), ('Estado', 16)]
+    for label, w in cols:
+        pdf.cell(w, 6, safe(label), fill=True, border=0)
+    pdf.ln(6)
+    for camp in meta_campaigns[:15]:
+        c_leads = 0
+        for a in camp.get('actions', []) or []:
+            if a.get('action_type') in ('lead', 'onsite_conversion.lead_grouped'):
+                c_leads += int(a.get('value', 0))
+        c_spend  = float(camp.get('spend', 0))
+        c_clicks = int(camp.get('clicks', 0))
+        c_impr   = int(camp.get('impressions', 0))
+        c_cpl    = round(c_spend / c_leads, 2) if c_leads else 0
+        c_ctr    = round(c_clicks / c_impr * 100, 2) if c_impr else 0
+        status_color = C_GREEN if c_leads > 0 else C_RED
+        # Para adset level: mostrar nombre del adset + campaña padre resumida
+        name = (camp.get('adset_name', camp.get('campaign_name', '?')) if is_adset
+                else camp.get('campaign_name', '?'))[:42]
+        pdf.set_font('Helvetica', '', 8)
+        pdf.set_text_color(*C_DARK)
+        pdf.cell(78, 6, safe(name), border='B')
+        pdf.cell(22, 6, f'${c_spend:,.0f}', border='B')
+        pdf.cell(18, 6, str(c_leads), border='B')
+        pdf.set_text_color(*status_color)
+        pdf.cell(22, 6, f'${c_cpl:,.0f}' if c_cpl else '-', border='B')
+        pdf.set_text_color(*C_DARK)
+        pdf.cell(18, 6, f'{c_ctr:.1f}%', border='B')
+        pdf.set_text_color(*status_color)
+        dot = 'OK' if c_leads > 0 else 'SIN CONV'
+        pdf.cell(16, 6, dot, border='B')
+        pdf.set_text_color(*C_DARK)
+        pdf.ln(6)
+
+    # ─── PÁGINA 2: CRM FUNNEL (si hay datos) ─────────────────────────
+    if crm_funnel:
+        pdf.add_page()
+        pdf.set_text_color(*C_DARK)
+        section_header(pdf, 'PIPELINE CRM — BHU/UIN')
+
+        f = crm_funnel['funnel']
+        total_pipe = f['contactados'] + f['interesados'] + f['evaluando'] + f['promesa_pago'] + f['estudiantes']
+        conv = round(f['estudiantes'] / total_pipe * 100, 1) if total_pipe else 0
+
+        # CRM KPIs
+        y0 = pdf.get_y()
+        kpi_card(pdf, 18,    y0, 55, 'Leads sin contactar', f['leads_sin_contactar'], 'pendientes de gestion', C_ORANGE)
+        kpi_card(pdf, 76,    y0, 55, 'En pipeline activo',  total_pipe,                 'deals abiertos',         C_BLUE)
+        kpi_card(pdf, 134,   y0, 55, 'Estudiantes',         f['estudiantes'],           f'Conv. {conv}%',         C_GREEN)
+        pdf.set_y(y0 + 28)
+
+        # Funnel bars
+        section_header(pdf, 'EMBUDO DE CONVERSION')
+        stages_display = [
+            ('1. Contactados',    f['contactados'],   C_BLUE),
+            ('2. Interesados',    f['interesados'],   (99, 102, 241)),
+            ('3. Evaluando',      f['evaluando'],     C_ORANGE),
+            ('4. Promesa de pago',f['promesa_pago'],  (234, 179, 8)),
+            ('Estudiantes [ok]',  f['estudiantes'],   C_GREEN),
+            ('Perdidos [x]',      f['perdidos'],      C_RED),
+        ]
+        ref = max(f['contactados'], 1)
+        for label, val, color in stages_display:
+            funnel_bar(pdf, label, val, ref, color)
+
+        # Top programs
+        section_header(pdf, 'TOP PROGRAMAS EN PIPELINE')
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(*C_DARK)
+        for prog, cnt in list(crm_funnel['top_programas'].items())[:6]:
+            pct = round(cnt / total_pipe * 100) if total_pipe else 0
+            pdf.cell(130, 6, safe(f'  {prog}'))
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.cell(20, 6, str(cnt))
+            pdf.set_font('Helvetica', '', 9)
+            pdf.cell(20, 6, f'{pct}%')
+            pdf.ln(6)
+
+        # Lead sources
+        section_header(pdf, 'FUENTES DE LEADS')
+        pdf.set_font('Helvetica', '', 9)
+        for src, cnt in list(crm_funnel['leads_por_fuente'].items())[:6]:
+            pct = round(cnt / crm_funnel['leads_total'] * 100) if crm_funnel['leads_total'] else 0
+            pdf.cell(120, 6, safe(f'  {src}'))
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.cell(20, 6, str(cnt))
+            pdf.set_font('Helvetica', '', 9)
+            pdf.cell(20, 6, f'{pct}%')
+            pdf.ln(6)
+
+    # ─── FOOTER en cada página ────────────────────────────────────────
+    pdf.set_y(-14)
+    pdf.set_font('Helvetica', '', 7)
+    pdf.set_text_color(*C_GRAY)
+    pdf.cell(0, 5, safe(f'Marketing Agent Bot  |  {today_str}  |  {client_name}'), align='C')
+
+    pdf.output(filepath)
+    return filepath
+
+
+def generate_seo_pdf(reports, month_str):
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+
+    EMOJI_MAP = {
+        '📊': '', '⚡': '', '🔍': '', '🤖': '', '📈': '', '🎯': '',
+        '🔑': '', '💡': '', '📅': '', '🌐': '', '🏷️': '',
+        '🟢': '[OK]', '🟡': '[~]', '🔴': '[!]',
+        '✅': 'SI', '❌': 'NO', '•': '-', '↑': '+', '↓': '-',
+        '*': '', '_': '', '`': '',
+    }
+
+    def clean(text):
+        for k, v in EMOJI_MAP.items():
+            text = text.replace(k, v)
+        text = re.sub(r'[^\x00-\x7F\xc0-\xff\n]', '', text)
+        return text.strip()
+
+    def safe_str(s):
+        return s.encode('latin-1', 'replace').decode('latin-1')
+
+    def cell(pdf, h, txt, **kw):
+        pdf.cell(0, h, safe_str(txt), new_x=XPos.LMARGIN, new_y=YPos.NEXT, **kw)
+
+    filepath = f'/tmp/reporte_seo_{month_str.replace(" ", "_")}.pdf'
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(20, 20, 20)
+
+    # ── Portada ──
+    pdf.add_page()
+    pdf.set_fill_color(30, 60, 120)
+    pdf.rect(0, 0, 210, 297, 'F')
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font('Helvetica', 'B', 32)
+    pdf.set_y(90)
+    cell(pdf, 16, 'Reporte SEO / AEO', align='C')
+    pdf.set_font('Helvetica', '', 20)
+    cell(pdf, 12, month_str, align='C')
+    pdf.set_font('Helvetica', '', 12)
+    pdf.set_text_color(180, 200, 240)
+    pdf.ln(6)
+    cell(pdf, 8, '6 clientes analizados', align='C')
+    cell(pdf, 8, 'Generado por Marketing Agent', align='C')
+    cell(pdf, 8, dt.date.today().strftime('%d/%m/%Y'), align='C')
+
+    SECTION_MARKERS = ['PERFORMANCE', 'SEO TECNICO', 'SEO T', 'AEO', 'SEARCH CONSOLE',
+                       'ACCIONES', 'Top keywords', 'Oportunidades', 'REPORTE']
+
+    for report_text in reports:
+        pdf.add_page()
+        pdf.set_text_color(0, 0, 0)
+        lines = clean(report_text).split('\n')
+        first = True
+        for line in lines:
+            line = line.strip()
+            if not line:
+                pdf.ln(2)
+                continue
+            # Title of each client report
+            if first:
+                pdf.set_fill_color(30, 60, 120)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_font('Helvetica', 'B', 13)
+                pdf.multi_cell(0, 9, safe_str(line), fill=True,
+                               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.set_text_color(0, 0, 0)
+                pdf.ln(3)
+                first = False
+            # Section headers
+            elif any(m in line for m in SECTION_MARKERS):
+                pdf.set_font('Helvetica', 'B', 10)
+                pdf.set_text_color(30, 60, 120)
+                pdf.set_fill_color(235, 240, 255)
+                pdf.multi_cell(0, 7, '  ' + safe_str(line), fill=True,
+                               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.set_text_color(0, 0, 0)
+                pdf.ln(1)
+            # Data lines
+            else:
+                pdf.set_font('Helvetica', '', 9)
+                pdf.multi_cell(0, 5.5, safe_str(line),
+                               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.output(filepath)
+    return filepath
+
+def run_seo_reports():
+    tg_send('🔍 Iniciando análisis SEO/AEO mensual...\n\nClientes: EBDS · Sibila · Tivenos · BehindU · ZoWeAre · Pediapartner\n\nEstimado: ~2 minutos')
+
+    # Get Google token once
+    try:
+        token = get_google_token()
+    except Exception as e:
+        token = None
+        print(f'Google token error: {e}')
+
+    # Parallel data fetching per client
+    def fetch_all(client):
+        name = client['name']
+        ps, tech, sc, ga4 = None, None, None, None
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            f_ps   = ex.submit(get_pagespeed, client['url'])
+            f_tech = ex.submit(crawl_seo, client['url'])
+            f_sc   = ex.submit(get_sc_data, token, client['sc_url']) if (token and client['sc_url']) else None
+            f_ga4  = ex.submit(get_ga4_data, token, client['ga4']) if (token and client.get('ga4')) else None
+            try: ps   = f_ps.result(timeout=25)
+            except Exception as e: print(f'PageSpeed {name}: {e}')
+            try: tech = f_tech.result(timeout=15)
+            except Exception as e: print(f'Crawl {name}: {e}')
+            if f_sc:
+                try: sc = f_sc.result(timeout=20)
+                except Exception as e: print(f'SC {name}: {e}')
+            if f_ga4:
+                try: ga4 = f_ga4.result(timeout=20)
+                except Exception as e: print(f'GA4 {name}: {e}')
+        return ps, tech, sc, ga4
+
+    all_reports = []
+    for client in SEO_CLIENTS:
+        try:
+            ps, tech, sc, ga4 = fetch_all(client)
+            if not tech:
+                tg_send(f'⚠️ {client["name"]}: no se pudo analizar el sitio.')
+                continue
+            report = build_seo_report(client['name'], ps, tech, sc, ga4)
+            all_reports.append(report)
+            # Send via Telegram (split if too long)
+            if len(report) > 3800:
+                mid = report.find('\n🎯')
+                if mid > 0:
+                    tg_send(report[:mid])
+                    tg_send(report[mid:])
+                else:
+                    tg_send(report[:3800])
+                    tg_send(report[3800:])
+            else:
+                tg_send(report)
+        except Exception as e:
+            tg_send(f'❌ Error analizando {client["name"]}: {str(e)[:100]}')
+
+    # Generate and send PDF
+    if all_reports:
+        try:
+            month_str = dt.date.today().replace(day=1).__sub__(dt.timedelta(days=1)).strftime('%B %Y')
+            pdf_path = generate_seo_pdf(all_reports, month_str)
+            tg_send_document(
+                pdf_path,
+                f'reporte_seo_aeo_{month_str.replace(" ", "_").lower()}.pdf',
+                caption=f'📄 Reporte SEO/AEO completo — {month_str}',
+                mimetype='application/pdf'
+            )
+            os.unlink(pdf_path)
+        except Exception as e:
+            print(f'PDF error: {e}')
+            tg_send(f'⚠️ PDF no pudo generarse: {str(e)[:100]}')
+
+    tg_send('✅ Análisis SEO/AEO completo.\n6 sitios analizados.\nPróximo reporte: 1er día hábil del mes que viene.')
+
+
+# --- Social post checker ---
+def check_new_posts(state):
+    last_ids = state.get('last_post_ids', {})
+
+    for acc in SOCIAL_ACCOUNTS:
+        client = acc['client']
+        new_posts = []  # acumular por cliente para agrupar en un solo mensaje
+
+        # ── Facebook ──
+        if acc.get('fb'):
+            key = f'fb_{acc["fb"]}'
+            try:
+                url = (f'https://graph.facebook.com/v21.0/{acc["fb"]}/posts'
+                       f'?fields=id,message,story,created_time,permalink_url'
+                       f'&limit=3&access_token={META_TOKEN}')
+                posts = http_req(url).get('data', [])
+                if posts:
+                    latest = posts[0]
+                    pid = latest.get('id')
+                    if pid and pid != last_ids.get(key):
+                        text = (latest.get('message') or latest.get('story') or 'Sin texto')[:200]
+                        link = latest.get('permalink_url', f'https://facebook.com/{acc["fb"]}')
+                        new_posts.append({'red': '📘 Facebook', 'text': text, 'link': link})
+                        last_ids[key] = pid
+            except Exception as e:
+                print(f'FB check {client}: {e}')
+
+        # ── Instagram ──
+        if acc.get('ig'):
+            key = f'ig_{acc["ig"]}'
+            try:
+                url = (f'https://graph.facebook.com/v21.0/{acc["ig"]}/media'
+                       f'?fields=id,caption,media_type,timestamp,permalink'
+                       f'&limit=3&access_token={META_TOKEN}')
+                posts = http_req(url).get('data', [])
+                if posts:
+                    latest = posts[0]
+                    pid = latest.get('id')
+                    if pid and pid != last_ids.get(key):
+                        caption = (latest.get('caption') or 'Sin caption')[:200]
+                        link = latest.get('permalink', 'https://instagram.com/')
+                        mtype = latest.get('media_type', '')
+                        icon = '🎥' if mtype in ['VIDEO', 'REEL'] else '📸'
+                        new_posts.append({'red': f'{icon} Instagram', 'text': caption, 'link': link})
+                        last_ids[key] = pid
+            except Exception as e:
+                print(f'IG check {client}: {e}')
+
+        # LinkedIn — requiere token separado (paso 2)
+
+        # ── Enviar UN solo mensaje agrupado por cliente ──
+        if new_posts:
+            if len(new_posts) == 1:
+                p = new_posts[0]
+                tg_send(
+                    f'{p["red"]} *Nueva publicación*\n\n'
+                    f'🏢 {client}\n'
+                    f'💬 _{p["text"]}_\n'
+                    f'🔗 {p["link"]}'
+                )
+            else:
+                # crosspost FB + IG → un solo mensaje
+                lines = f'📣 *Nueva publicación — {client}*\n\n'
+                for p in new_posts:
+                    lines += f'{p["red"]}: {p["link"]}\n'
+                lines += f'\n💬 _{new_posts[0]["text"]}_'
+                tg_send(lines)
+
+    state['last_post_ids'] = last_ids
+    return state
+
+
+# ─── CALENDAR STORAGE (usa la state task existente, key "calendar") ──
+
+def get_calendar_data(month_str=None):
+    """Lee datos del calendario usando read_state() (maneja base64 automáticamente)."""
+    try:
+        state = read_state()
+        all_data = state.get('calendar', {})
+        if month_str:
+            return all_data.get(month_str, {})
+        return all_data
+    except Exception as e:
+        print(f'Cal get error: {e}')
+        return {}
+
+def merge_calendar_into_state(state, month_str, month_data):
+    """Inserta datos de calendario en el dict de estado SIN guardar. Mantiene max 3 meses."""
+    all_data = state.get('calendar', {})
+    all_data[month_str] = month_data
+    months = sorted(all_data.keys())
+    if len(months) > 3:
+        for old in months[:-3]:
+            del all_data[old]
+    state['calendar'] = all_data
+    return state
+
+def save_calendar_data(month_str, month_data):
+    """Guarda datos de un mes en la state task. Usado desde /calendar/save (HTTP route)."""
+    try:
+        state = read_state()
+        state = merge_calendar_into_state(state, month_str, month_data)
+        save_state(state)
+    except Exception as e:
+        print(f'Cal save error: {e}')
+
+
+def get_posting_dates(year, month):
+    first = dt.date(year, month, 1)
+    next_m = month + 1 if month < 12 else 1
+    next_y = year if month < 12 else year + 1
+    last = dt.date(next_y, next_m, 1) - dt.timedelta(days=1)
+    dates = []
+    d = first
+    while d <= last:
+        if d.weekday() in [0, 2, 4]:  # Mon=0, Wed=2, Fri=4
+            dates.append(d)
+        d += dt.timedelta(days=1)
+    return dates
+
+def assign_formats(brands_list, posting_dates):
+    assignments = {}
+    slot_idx = 0
+    zoweare_count = 0
+    for date in posting_dates:
+        day = {}
+        rotation = CALENDAR_FORMAT_ROTATION[slot_idx % len(CALENDAR_FORMAT_ROTATION)]
+        for i, brand in enumerate(brands_list):
+            if brand == 'ZoWeAre':
+                if zoweare_count < 5:
+                    day[brand] = rotation[i % len(rotation)]
+                    zoweare_count += 1
+            else:
+                day[brand] = rotation[i % len(rotation)]
+        assignments[date.isoformat()] = day
+        slot_idx += 1
+    return assignments
+
+CONTENT_STYLE_GUIDE = """
+IDIOMA OBLIGATORIO: Español neutro — sin conjugaciones de "vos" (prohibido: hacés/tenés/querés/podés/mirá/descubrí/aprendé/usá/dale). Usar "tú/te/tu" o formas impersonales. Esto es innegociable.
+
+REGLAS DE FORMATO texto_imagen:
+- Post (imagen fija): titular impactante máx 12 palabras + subtítulo opcional + "(logo [MARCA])" al final
+- Carrusel (mínimo 5 slides): "S1: [tema de apertura]\\nS2: [punto clave → beneficio concreto]\\nS3: [punto clave → beneficio concreto]\\nS4: [punto clave → beneficio concreto]\\nS5: [punto clave → beneficio concreto]\\nS6: [CTA + web de la marca]" — cada slide tiene texto corto, impactante
+- Reel (guion completo, NO dejar incompleto):
+  "Gancho (0-3s): [descripción exacta de la escena de apertura — qué se ve en pantalla]\\nEscena 1 (3-10s): [qué se muestra/hace]\\nEscena 2 (10-20s): [qué se muestra/hace]\\nEscena 3 (20-28s): [qué se muestra/hace]\\nNarración completa: \\'[guion hablado completo de 40-60 palabras, español neutro]\'\\nTexto superpuesto: \\'[frase clave que aparece en pantalla]\'\\nCTA final (28-35s): \\'[texto del CTA visible en pantalla + acción concreta]\'"
+
+REGLAS DE COPY: máx 120 palabras, tono directo y aspiracional, usa → para listar beneficios, 1-2 emojis por bloque, siempre terminar con CTA al link de la bio y 3-5 hashtags.
+Sin saltos de línea literales en el JSON (usar \\n dentro del string).
+"""
+
+BRAND_STYLE_EXAMPLES = {
+    'EBDS': """
+EJEMPLOS REALES DE CONTENIDO EBDS:
+
+POST:
+texto_imagen: "¿Piensas en formarte, especializarte o dar un salto profesional?\\nTu momento de crecer es ahora.\\n(logo EBDS)"
+copy: "🎓 Formación online que transforma carreras.\\nNuestros programas están diseñados para profesionales que no se conforman con menos.\\n→ Tecnología aplicada\\n→ Docentes con experiencia real\\n→ Titulación europea\\nDa el salto que estás esperando. 🔗 Link en la bio.\\n#EBDS #FormaciónOnline #DesarrolloProfesional"
+
+CARRUSEL:
+texto_imagen: "S1: De Desarrollador a Líder\\nS2: Dominio Técnico → Experticia comprobable\\nS3: Metodologías Ágiles → Scrum, Kanban, SAFe\\nS4: Gestión de Talento → Liderazgo de equipos\\nS5: Visión de Negocio 4.0 → Estrategia + tecnología\\nS6: ¿Listo para el siguiente nivel? → ebds.online"
+copy: "¿Eres desarrollador y quieres liderar equipos? 🚀\\nEl salto no es solo técnico — es de mentalidad.\\nTe mostramos el camino en 5 pasos →\\nNuestro Master en Gestión de Proyectos Tech te da las herramientas.\\n🔗 Link en la bio.\\n#EBDS #LiderazgoTech #GestiónDeProyectos #TransformaciónDigital"
+
+REEL:
+texto_imagen: "Gancho (0-3s): Alumno compartiendo pantalla del Campus Virtual EBDS, navegando con herramientas de IA\\nEscena 1 (3-10s): Muestra el módulo de IA: el alumno interactúa con modelos de lenguaje en tiempo real\\nEscena 2 (10-20s): Corte rápido — notificación de certificado completado, alumno sonriendo\\nEscena 3 (20-28s): Frase animada en pantalla sobre el beneficio profesional\\nNarración completa: \\'En EBDS no solo estudias. Desde el primer módulo trabajas con las herramientas que usan las mejores empresas. Inteligencia artificial, data analytics, gestión de proyectos. Formación online con titulación europea. Tu carrera empieza a cambiar hoy.\\'\\nTexto superpuesto: \\'No solo estudias. Aplicas.\\'\\nCTA final (28-35s): \\'Conoce nuestros programas — Link en la bio\\'"
+copy: "¿Sabías que nuestros alumnos usan IA desde el primer módulo? 🤖\\nEn EBDS no solo aprendes — aplicas en tiempo real.\\nFormación online con herramientas del futuro.\\n🔗 Programas en el link en la bio.\\n#EBDS #InteligenciaArtificial #FormaciónOnline #FuturoProfesional"
+""",
+    'Sibila': """
+EJEMPLOS DE CONTENIDO SIBILA:
+
+POST:
+texto_imagen: "¿Tu equipo atiende por WhatsApp, email y teléfono por separado?\\nHay una mejor forma.\\n(logo Sibila)"
+copy: "💬 Cada canal desconectado es un cliente frustrado.\\nSibila centraliza WhatsApp, Email, SMS y más en una sola plataforma con IA.\\n→ Respuestas más rápidas\\n→ Historial unificado del cliente\\n→ Menos errores, más satisfacción\\nTransforma tu atención al cliente hoy. 🔗 Link en la bio.\\n#Sibila #Omnicanal #AtenciónAlCliente #IA"
+
+CARRUSEL:
+texto_imagen: "S1: El problema: comunicación dispersa\\nS2: Canal 1 — WhatsApp sin control centralizado\\nS3: Canal 2 — Email sin seguimiento real\\nS4: Canal 3 — Teléfono sin historial\\nS5: La solución — Sibila unifica todo con IA\\nS6: Resultado: 40% menos tiempo de respuesta → sibila.app"
+copy: "¿Cuántos canales de atención tiene tu empresa? 📊\\nWhatsApp, email, teléfono, redes... sin un hub central, la experiencia del cliente sufre.\\nSibila lo resuelve en una sola plataforma.\\n→ Un lugar, todos los canales\\n→ IA que automatiza respuestas frecuentes\\n→ Métricas en tiempo real\\nConoce cómo funciona → 🔗 Link en la bio.\\n#Sibila #CX #Chatbot #AutomatizaciónEmpresarial"
+
+REEL:
+texto_imagen: "Gancho (0-3s): Notificaciones llegando de todos lados — WhatsApp, email, teléfono — en caos\\nEscena 1 (3-10s): Agente de atención al cliente abrumado saltando entre pantallas\\nEscena 2 (10-20s): Corte — mismo agente ahora en Sibila: todos los canales en una sola pantalla, con respuestas sugeridas por IA\\nEscena 3 (20-28s): Métrica en pantalla: -40% tiempo de respuesta, clientes satisfechos\\nNarración completa: \\'Tu equipo no debería perder tiempo saltando entre canales. Sibila centraliza WhatsApp, email, SMS y más en una sola plataforma con IA. Menos caos, más clientes satisfechos. Empieza hoy.\\'\\nTexto superpuesto: \\'Todos tus canales. Una sola plataforma.\\'\\nCTA final (28-35s): \\'Pide tu demo — Link en la bio\\'"
+copy: "¿Cuánto tiempo pierde tu equipo saltando entre canales? ⏱️\\nCon Sibila, WhatsApp, Email y SMS se gestionan desde un solo lugar con IA.\\n→ Respuestas automáticas para preguntas frecuentes\\n→ Historial unificado por cliente\\n→ Métricas en tiempo real\\n🔗 Demo gratuita en el link de la bio.\\n#Sibila #AtenciónAlCliente #CX #Omnicanal"
+""",
+    '_generic': """
+FORMATO DE REFERENCIA:
+
+POST:
+texto_imagen: "[Titular impactante que resume el valor principal de la marca]\\n[Subtítulo opcional con dato o beneficio]\\n(logo [MARCA])"
+copy: "[Emoji] [Frase de apertura que conecta con el problema del cliente].\\n[Desarrollo con flechas →]\\n→ Beneficio 1\\n→ Beneficio 2\\n→ Beneficio 3\\n[CTA]. 🔗 Link en la bio.\\n#[hashtag1] #[hashtag2] #[hashtag3]"
+
+CARRUSEL:
+texto_imagen: "S1: [Tema de apertura — el problema o la promesa]\\nS2: [Punto clave 1 → beneficio]\\nS3: [Punto clave 2 → beneficio]\\nS4: [Punto clave 3 → beneficio]\\nS5: [Punto clave 4 → beneficio]\\nS6: [CTA + web de la marca]"
+copy: "[Pregunta o afirmación que conecta con el dolor del cliente] 🎯\\n[Desarrollo breve de la propuesta de valor]\\n→ Beneficio 1\\n→ Beneficio 2\\n→ Beneficio 3\\n[CTA]. 🔗 Link en la bio.\\n#[hashtag1] #[hashtag2] #[hashtag3]"
+
+REEL:
+texto_imagen: "Gancho (0-3s): [escena de apertura visual impactante]\\nEscena 1 (3-10s): [qué se muestra]\\nEscena 2 (10-20s): [qué se muestra]\\nEscena 3 (20-28s): [qué se muestra]\\nNarración completa: \\'[guion hablado completo de 40-60 palabras]\'\\nTexto superpuesto: \\'[frase clave en pantalla]\'\\nCTA final (28-35s): \\'[texto del CTA visible]\'"
+""",
+}
+
+def generate_social_posts(brand, month_label, slots):
+    """Genera social posts en batches de 4 para no exceder tokens."""
+    if not slots:
+        return []
+    context = BRAND_CONTEXT.get(brand, brand)
+    days_es = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo']
+    examples = BRAND_STYLE_EXAMPLES.get(brand, BRAND_STYLE_EXAMPLES['_generic'])
+
+    all_posts = []
+    batch_size = 4
+    for i in range(0, len(slots), batch_size):
+        batch = slots[i:i+batch_size]
+        slots_info = [{'date': s[0].isoformat() if hasattr(s[0],'isoformat') else s[0],
+                       'day': days_es[dt.date.fromisoformat(str(s[0])).weekday()],
+                       'type': s[1]} for s in batch]
+        prompt = f"""Genera {len(slots_info)} posts para {brand} — {month_label}.
+
+MARCA: {context}
+
+{CONTENT_STYLE_GUIDE}
+{examples}
+SLOTS A GENERAR:
+{json.dumps(slots_info, ensure_ascii=False)}
+
+IMPORTANTE: Los Reels deben tener el guion COMPLETO — todas las escenas, la narración entera y el CTA. No dejar nada incompleto.
+
+SOLO JSON array, sin texto extra antes ni después:
+[{{"date":"YYYY-MM-DD","day":"Dia","type":"Reel/Carrusel/Post","pilar":"categoria","objetivo":"awareness/educacion/conversion","titulo":"max 60 chars","texto_imagen":"estructura visual del contenido COMPLETA","copy":"caption para redes max 120 palabras","hashtags":"#tag1 #tag2 #tag3"}}]"""
+        try:
+            r = claude(prompt, max_tokens=3000)
+            m = re.search(r'\[.*?\]', r, re.DOTALL)
+            if m:
+                batch_posts = json.loads(m.group())
+                for p in batch_posts:
+                    p.update({'id': f'{brand.lower()}-{p.get("date",i)}', 'brand': brand,
+                              'status': 'pendiente', 'comments': '', 'networks': ['Instagram','Facebook']})
+                all_posts.extend(batch_posts)
+        except Exception as e:
+            print(f'Social gen {brand} batch {i}: {e}')
+    return all_posts
+
+def generate_linkedin_posts(brand, month_label, count):
+    context = BRAND_CONTEXT.get(brand, brand)
+    prompt = f"""Genera {count} publicaciones de LinkedIn para {brand} — {month_label}.
+
+MARCA: {context}
+
+IDIOMA: Español neutro — sin conjugaciones de vos (no hacés/tenés/querés). Usar tú o formas impersonales.
+
+Estilo: thought leadership, educativo o caso de éxito. Párrafos cortos (2-3 líneas máx), gancho fuerte en la primera línea, datos concretos cuando aplica, CTA al final.
+
+Devuelve SOLO JSON:
+[{{"titulo":"titulo max 70 chars","pilar":"categoria","objetivo":"thought leadership/educacion/caso de exito","copy":"texto 200-250 palabras listo para LinkedIn, con saltos de linea como \\n"}}]"""
+    try:
+        r = claude(prompt, max_tokens=3000)
+        m = re.search(r'\[.*\]', r, re.DOTALL)
+        if m:
+            posts = json.loads(m.group())
+            for i, p in enumerate(posts):
+                p.update({'id': f'{brand.lower()}-li-{i+1}', 'brand': brand, 'type': 'LinkedIn', 'date': '', 'status': 'pendiente', 'comments': ''})
+            return posts
+    except Exception as e:
+        print(f'LinkedIn gen {brand}: {e}')
+    return []
+
+def generate_blog_posts(brand, month_label, count):
+    context = BRAND_CONTEXT.get(brand, brand)
+    prompt = f"""Genera {count} artículos de blog para {brand} — {month_label}.
+
+MARCA: {context}
+
+IDIOMA: Español neutro — sin conjugaciones de vos (no hacés/tenés/querés). Usar tú o formas impersonales.
+
+SEO-friendly, informativos, orientados a resolver una duda del cliente ideal. Devuelve SOLO JSON:
+[{{"titulo":"titulo SEO max 70 chars","pilar":"categoria","objetivo":"SEO/educacion/conversion","copy":"intro (2 párrafos) + 3 secciones con H2 + conclusión con CTA (max 300 palabras total, saltos de linea como \\n)"}}]"""
+    try:
+        r = claude(prompt, max_tokens=2500)
+        m = re.search(r'\[.*\]', r, re.DOTALL)
+        if m:
+            posts = json.loads(m.group())
+            for i, p in enumerate(posts):
+                p.update({'id': f'{brand.lower()}-blog-{i+1}', 'brand': brand, 'type': 'Blog', 'date': '', 'status': 'pendiente', 'comments': ''})
+            return posts
+    except Exception as e:
+        print(f'Blog gen {brand}: {e}')
+    return []
+
+def generate_email_posts(brand, month_label, count):
+    context = BRAND_CONTEXT.get(brand, brand)
+    prompt = f"""Genera {count} emails de marketing para {brand} — {month_label}.
+
+MARCA: {context}
+
+IDIOMA: Español neutro — sin conjugaciones de vos (no hacés/tenés/querés). Usar tú o formas impersonales.
+
+Objetivo: nutrir leads, convertir o fidelizar. Devuelve SOLO JSON:
+[{{"titulo":"asunto del email max 50 chars","pilar":"categoria","objetivo":"nurturing/conversion/fidelizacion","copy":"asunto + preheader (1 línea) + cuerpo (3 párrafos cortos) + CTA (max 200 palabras, saltos de linea como \\n)"}}]"""
+    try:
+        r = claude(prompt, max_tokens=2000)
+        m = re.search(r'\[.*\]', r, re.DOTALL)
+        if m:
+            posts = json.loads(m.group())
+            for i, p in enumerate(posts):
+                p.update({'id': f'{brand.lower()}-email-{i+1}', 'brand': brand, 'type': 'Email', 'date': '', 'status': 'pendiente', 'comments': ''})
+            return posts
+    except Exception as e:
+        print(f'Email gen {brand}: {e}')
+    return []
+
+
+def regenerate_single_post(post, instruction=''):
+    """Regenera un post individual. Mantiene brand/date/type, genera contenido nuevo."""
+    brand     = post.get('brand', '')
+    post_type = post.get('type', 'Post')
+    date_str  = post.get('date', '')
+    context   = BRAND_CONTEXT.get(brand, brand)
+    examples  = BRAND_STYLE_EXAMPLES.get(brand, BRAND_STYLE_EXAMPLES['_generic'])
+    days_es   = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo']
+    day_name  = ''
+    if date_str:
+        try:
+            day_name = days_es[dt.date.fromisoformat(date_str).weekday()]
+        except Exception:
+            pass
+    instr_note = f'\nINSTRUCCIÓN ESPECIAL (aplicar obligatoriamente): {instruction}' if instruction else \
+                 '\nGenera un ángulo completamente diferente al habitual — nuevo gancho, distinto pilar, enfoque alternativo.'
+    slot = [{'date': date_str, 'day': day_name, 'type': post_type}]
+    prompt = f"""Genera 1 post para {brand}.
+
+MARCA: {context}
+{CONTENT_STYLE_GUIDE}
+{examples}
+{instr_note}
+
+SLOT: {json.dumps(slot, ensure_ascii=False)}
+
+Los Reels deben tener el guion COMPLETO — todas las escenas, narración entera y CTA.
+
+SOLO JSON array con 1 elemento:
+[{{"date":"{date_str}","day":"{day_name}","type":"{post_type}","pilar":"categoria","objetivo":"awareness/educacion/conversion","titulo":"max 60 chars","texto_imagen":"estructura visual COMPLETA","copy":"caption max 120 palabras","hashtags":"#tag1 #tag2 #tag3"}}]"""
+    r = claude(prompt, max_tokens=3000)
+    m = re.search(r'\[.*?\]', r, re.DOTALL)
+    if m:
+        posts = json.loads(m.group())
+        if posts:
+            p = posts[0]
+            p.update({
+                'id':       post.get('id', f'{brand.lower()}-{date_str}'),
+                'brand':    brand,
+                'status':   'pendiente',
+                'comments': post.get('comments', ''),
+                'networks': post.get('networks', ['Instagram', 'Facebook']),
+            })
+            return p
+    return None
+
+
+def h_regen_post(text, state):
+    """Regenera uno o más posts del calendario desde Telegram."""
+    t = text.lower()
+
+    # Brand
+    brand_keys = {'ebds':'EBDS','sibila':'Sibila','zoweare':'ZoWeAre','tivenos':'Tivenos','bhu':'BHU','behind':'BHU'}
+    brand = next((v for k,v in brand_keys.items() if k in t), None)
+    if not brand:
+        tg_send('¿Para qué marca regenero el contenido?\n\n• EBDS  • Sibila  • ZoWeAre  • Tivenos  • BHU')
+        return state
+
+    # Month
+    months_map = {'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,
+                  'julio':7,'agosto':8,'septiembre':9,'octubre':10,'noviembre':11,'diciembre':12}
+    month_num = next((v for k,v in months_map.items() if k in t), None)
+    today = dt.date.today()
+    if not month_num:
+        nxt = today.replace(day=1) + dt.timedelta(days=32)
+        month_num, year = nxt.month, nxt.year
+    else:
+        year = today.year
+        if month_num < today.month:
+            year += 1
+    month_str = f'{year}-{str(month_num).zfill(2)}'
+
+    # Day number (e.g. "del 3", "el 15")
+    day_match = re.search(r'\b(\d{1,2})\b', text)
+    target_day = int(day_match.group(1)) if day_match else None
+
+    # Type filter
+    type_map = {'reel':'Reel','carrusel':'Carrusel','post':'Post','linkedin':'LinkedIn','blog':'Blog','email':'Email'}
+    type_filter = next((v for k,v in type_map.items() if k in t), None)
+
+    # Instruction (text after "que sea", "con enfoque", "sobre", "estilo", "hablando de", etc.)
+    instr_match = re.search(
+        r'(?:que sea|con enfoque(?: en)?|enfocado en|estilo|tono|hablando de|sobre|acerca de|instrucción:?)\s+(.+)',
+        t, re.IGNORECASE
+    )
+    instruction = instr_match.group(1).strip() if instr_match else ''
+
+    # Find matching posts
+    month_data = get_calendar_data(month_str)
+    brand_posts = month_data.get(brand, [])
+
+    to_regen = []
+    for p in brand_posts:
+        if target_day:
+            try:
+                if dt.date.fromisoformat(p.get('date', '')).day != target_day:
+                    continue
+            except Exception:
+                pass
+        if type_filter and p.get('type') != type_filter:
+            continue
+        to_regen.append(p)
+
+    if not to_regen:
+        key = os.environ.get('CALENDAR_KEY', 'sofia2026mkt')
+        tg_send(
+            f'No encontré posts de *{brand}* que coincidan en {month_str}.\n\n'
+            f'Verifica el calendario: https://vercel-deploy-tan-one.vercel.app/calendar?key={key}&month={month_str}'
+        )
+        return state
+
+    if len(to_regen) > 4:
+        tg_send(
+            f'Eso son {len(to_regen)} posts — sé más específica.\n'
+            f'Ej: _"rehaceme el reel del 3 de junio de EBDS"_ o _"regenera el carrusel del 10 de junio de EBDS que sea sobre empleabilidad"_'
+        )
+        return state
+
+    tg_send(f'🔄 Regenerando {len(to_regen)} post{"s" if len(to_regen)>1 else ""} de *{brand}*...')
+
+    regenerated = 0
+    for post in to_regen:
+        try:
+            new_post = regenerate_single_post(post, instruction)
+            if new_post:
+                for i, p in enumerate(month_data[brand]):
+                    if p.get('id') == post.get('id'):
+                        month_data[brand][i] = new_post
+                        break
+                regenerated += 1
+        except Exception as e:
+            print(f'Regen post error: {e}')
+
+    if regenerated > 0:
+        save_calendar_data(month_str, month_data)
+        key = os.environ.get('CALENDAR_KEY', 'sofia2026mkt')
+        tg_send(
+            f'✅ {regenerated} post{"s" if regenerated>1 else ""} regenerado{"s" if regenerated>1 else ""} para *{brand}*\n\n'
+            f'🔗 https://vercel-deploy-tan-one.vercel.app/calendar?key={key}&month={month_str}'
+        )
+    else:
+        tg_send('❌ No pude regenerar los posts. Intentá de nuevo.')
+    return state
+
+
+def h_calendar(text, state):
+    """Encola la generación de contenido. El endpoint /calendar/generate procesa de a 1 marca."""
+    t = text.lower()
+    months_map = {
+        'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4,
+        'mayo': 5, 'junio': 6, 'julio': 7, 'agosto': 8,
+        'septiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+    }
+    month_num = next((v for k, v in months_map.items() if k in t), None)
+    today = dt.date.today()
+    if not month_num:
+        next_m = today.replace(day=1) + dt.timedelta(days=32)
+        month_num = next_m.month
+        year = next_m.year
+    else:
+        year = today.year
+        if month_num < today.month:
+            year += 1
+    month_str = f'{year}-{str(month_num).zfill(2)}'
+    month_names = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre']
+    month_label = f'{month_names[month_num]} {year}'
+
+    brand_keys = {'ebds': 'EBDS', 'sibila': 'Sibila', 'zoweare': 'ZoWeAre', 'tivenos': 'Tivenos', 'bhu': 'BHU', 'behind': 'BHU'}
+    if 'todas' in t or 'todo' in t:
+        brands_to_gen = list(CALENDAR_BRANDS)
+    else:
+        brands_to_gen = list({v for k, v in brand_keys.items() if k in t})
+
+    if not brands_to_gen:
+        tg_send('¿Para qué marca genero el calendario?\n\n• EBDS\n• Sibila\n• ZoWeAre\n• Tivenos\n• BHU\n• Todas')
+        return state
+
+    # Encolar — /calendar/generate procesa de a 1 marca para no exceder timeout de Vercel
+    state['pending_calendar'] = {
+        'brands': brands_to_gen,
+        'month_str': month_str,
+        'month_label': month_label,
+        'idx': 0
+    }
+    n = len(brands_to_gen)
+    tg_send(
+        f'📅 *Generando calendario...*\n\n'
+        f'📆 {month_label}\n'
+        f'🏢 {", ".join(brands_to_gen)}\n\n'
+        f'⏳ {n} marca{"s" if n > 1 else ""}... (~{n*2} min)'
+    )
+    state['_trigger_calendar'] = True  # señal para el webhook de disparar el generate
+    return state
+
+
+CALENDAR_HTML = '''<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Calendario de Contenido</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8fafc;color:#1e293b;min-height:100vh}
+header{background:white;border-bottom:1px solid #e2e8f0;padding:14px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;position:sticky;top:0;z-index:50}
+h1{font-size:17px;font-weight:700;white-space:nowrap}
+.month-nav{display:flex;align-items:center;gap:8px}
+.month-nav button{background:#f1f5f9;border:none;width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:14px;transition:background .2s}
+.month-nav button:hover{background:#e2e8f0}
+.month-nav span{font-weight:600;min-width:130px;text-align:center;font-size:14px}
+.brand-tabs{display:flex;gap:5px;flex-wrap:wrap}
+.brand-tab{padding:5px 12px;border-radius:20px;border:2px solid;cursor:pointer;font-size:12px;font-weight:600;transition:all .2s;background:white}
+.main{padding:20px;max-width:1400px;margin:0 auto}
+.cal-wrap{background:white;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0}
+.cal-header{display:grid;grid-template-columns:48px repeat(5,1fr);background:#f8fafc;border-bottom:1px solid #e2e8f0}
+.cal-header div{padding:10px 8px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;text-align:center;letter-spacing:.5px}
+.cal-body{display:grid;grid-template-columns:48px repeat(5,1fr)}
+.week-lbl{background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;align-items:flex-start;justify-content:center;padding-top:12px;font-size:11px;color:#94a3b8;font-weight:600}
+.day-cell{border-right:1px solid #f1f5f9;border-bottom:1px solid #f1f5f9;padding:6px;min-height:110px;transition:background .15s}
+.day-cell:hover{background:#fafafa}
+.day-cell.inactive{background:#fafafa;opacity:.4}
+.day-num{font-size:11px;color:#94a3b8;margin-bottom:5px;font-weight:500}
+.chip{display:flex;align-items:center;gap:3px;padding:4px 7px;border-radius:6px;margin-bottom:3px;cursor:pointer;transition:opacity .2s;font-size:11px;border:1px solid transparent}
+.chip:hover{opacity:.8;transform:translateY(-1px)}
+.chip-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:#1e293b}
+.chip-icon{flex-shrink:0;font-size:10px}
+.chip-status{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.add-btn{display:block;text-align:center;color:#cbd5e1;cursor:pointer;font-size:16px;padding:2px;border-radius:4px;transition:all .15s;line-height:1}
+.add-btn:hover{background:#f1f5f9;color:#64748b}
+.extras{margin-top:24px}
+.extras h3{font-size:14px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:24px}
+.card{background:white;border-radius:10px;padding:14px;border-left:4px solid;cursor:pointer;transition:transform .2s,box-shadow .2s;border:1px solid #e2e8f0;border-left-width:4px}
+.card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08)}
+.card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px}
+.card-brand{font-size:11px;font-weight:700}
+.status-pill{font-size:10px;font-weight:600;padding:2px 8px;border-radius:12px}
+.card-title{font-size:13px;font-weight:600;margin-bottom:5px;line-height:1.3}
+.card-meta{font-size:11px;color:#94a3b8}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
+.modal{background:white;border-radius:14px;padding:22px;width:100%;max-width:580px;max-height:88vh;overflow-y:auto}
+.modal-hd{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}
+.modal-hd h3{font-size:15px;font-weight:700;line-height:1.3}
+.close-btn{background:none;border:none;font-size:20px;cursor:pointer;color:#94a3b8;flex-shrink:0;padding:0 4px}
+label{display:block;font-size:11px;font-weight:700;color:#64748b;margin:12px 0 4px;text-transform:uppercase;letter-spacing:.4px}
+input,textarea,select{width:100%;border:1px solid #e2e8f0;border-radius:8px;padding:8px 11px;font-size:13px;font-family:inherit;transition:border .2s;outline:none}
+input:focus,textarea:focus,select:focus{border-color:#94a3b8}
+textarea{min-height:90px;resize:vertical}
+.modal-actions{display:flex;gap:8px;margin-top:16px}
+.btn-save{background:#1e293b;color:white;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:background .2s}
+.btn-save:hover{background:#334155}
+.btn-cancel{background:#f1f5f9;color:#64748b;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:13px}
+.btn-regen{background:none;border:none;cursor:pointer;font-size:15px;padding:2px 5px;border-radius:5px;opacity:.6;transition:opacity .2s,background .2s;line-height:1}
+.btn-regen:hover{opacity:1;background:#f0fdf4}
+.regen-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1001;align-items:center;justify-content:center}
+.regen-overlay.show{display:flex}
+.regen-modal{background:white;border-radius:14px;padding:28px;width:min(420px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.25)}
+.regen-modal h3{margin:0 0 6px;font-size:16px;color:#1e293b}
+.regen-modal p{margin:0 0 16px;font-size:13px;color:#64748b}
+.regen-modal textarea{width:100%;box-sizing:border-box;padding:10px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:13px;resize:vertical;min-height:70px;font-family:inherit}
+.regen-modal textarea:focus{outline:none;border-color:#6366f1}
+.regen-actions{display:flex;gap:10px;margin-top:14px}
+.btn-regen-go{flex:1;background:#6366f1;color:white;border:none;padding:11px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:background .2s}
+.btn-regen-go:hover{background:#4f46e5}
+.btn-regen-go:disabled{background:#a5b4fc;cursor:default}
+.regen-spinner{display:none;text-align:center;font-size:22px;margin:10px 0}
+.regen-spinner.show{display:block}
+.hidden{display:none!important}
+.legend{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+.legend-item{display:flex;align-items:center;gap:4px;font-size:11px;color:#64748b}
+.legend-dot{width:10px;height:10px;border-radius:3px}
+.cal-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.empty-msg{text-align:center;padding:60px 20px;color:#94a3b8;font-size:14px}
+/* Agenda view (mobile) */
+.agenda{display:none}
+.agenda-day{margin-bottom:16px;background:white;border-radius:10px;overflow:hidden;border:1px solid #e2e8f0}
+.agenda-date{padding:8px 14px;background:#f8fafc;font-size:12px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #e2e8f0}
+.agenda-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid #f1f5f9;cursor:pointer;border-left:3px solid transparent;transition:background .15s}
+.agenda-row:last-child{border-bottom:none}
+.agenda-row:hover{background:#f8fafc}
+.agenda-type{font-size:11px;font-weight:700;white-space:nowrap;min-width:72px}
+.agenda-brand{font-size:11px;font-weight:600;white-space:nowrap;min-width:50px}
+.agenda-title{font-size:12px;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+@media(max-width:700px){
+  .cal-wrap{display:none}
+  .agenda{display:block}
+  .main{padding:10px}
+  header{padding:10px 12px;gap:8px}
+  h1{font-size:15px}
+  .month-nav span{min-width:100px;font-size:13px}
+  .brand-tabs{gap:4px}
+  .brand-tab{padding:4px 9px;font-size:11px}
+  .legend{gap:6px}
+  .legend-item{font-size:10px}
+  .cards-grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>📅 Calendario</h1>
+  <div class="month-nav">
+    <button onclick="changeMonth(-1)">&#9664;</button>
+    <span id="month-lbl">—</span>
+    <button onclick="changeMonth(1)">&#9654;</button>
+  </div>
+  <div class="brand-tabs" id="brand-tabs"></div>
+</header>
+<div class="main">
+  <div class="legend" id="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#16a34a"></div>Reel</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#9333ea"></div>Carrusel</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#2563eb"></div>Post</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#0284c7"></div>LinkedIn</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ea580c"></div>Blog</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#dc2626"></div>Email</div>
+    <div class="legend-item" style="margin-left:8px"><div class="chip-status" style="background:#22c55e;width:8px;height:8px;border-radius:50%"></div> Aprobado</div>
+    <div class="legend-item"><div class="chip-status" style="background:#f59e0b;width:8px;height:8px;border-radius:50%"></div> Pendiente</div>
+    <div class="legend-item"><div class="chip-status" style="background:#ef4444;width:8px;height:8px;border-radius:50%"></div> Con cambios</div>
+  </div>
+  <div class="cal-scroll">
+    <div class="cal-wrap" style="min-width:520px">
+      <div class="cal-header">
+        <div></div><div>Lunes</div><div>Martes</div><div>Miércoles</div><div>Jueves</div><div>Viernes</div>
+      </div>
+      <div class="cal-body" id="cal-body"></div>
+    </div>
+  </div>
+  <div class="agenda" id="agenda"></div>
+  <div class="extras" id="extras"></div>
+</div>
+<div class="overlay hidden" id="overlay">
+  <div class="modal" id="modal">
+    <div class="modal-hd">
+      <h3 id="modal-title"></h3>
+      <button class="close-btn" onclick="closeModal()">&#215;</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+<script>
+const KEY=new URLSearchParams(location.search).get(\'key\')||\'\';
+const BC={EBDS:\'#1e3a8a\',Sibila:\'#7c3aed\',ZoWeAre:\'#059669\',Tivenos:\'#dc2626\',BHU:\'#d97706\'};
+const TC={Reel:\'#16a34a\',Carrusel:\'#9333ea\',Post:\'#2563eb\',LinkedIn:\'#0284c7\',Blog:\'#ea580c\',Email:\'#dc2626\'};
+const TI={Reel:\'\\uD83C\\uDFA5\',Carrusel:\'\\uD83D\\uDCF1\',Post:\'\\uD83D\\uDCDD\',LinkedIn:\'\\uD83D\\uDCBC\',Blog:\'\\uD83D\\uDCC4\',Email:\'\\u2709\\uFE0F\'};
+const SC={pendiente:\'#f59e0b\',aprobado:\'#22c55e\',con_cambios:\'#ef4444\'};
+const MN=[\'Enero\',\'Febrero\',\'Marzo\',\'Abril\',\'Mayo\',\'Junio\',\'Julio\',\'Agosto\',\'Septiembre\',\'Octubre\',\'Noviembre\',\'Diciembre\'];
+let curMonth=\'\',data={},active=\'all\',curPost=null;
+const urlM=new URLSearchParams(location.search).get(\'month\');
+const n=new Date();
+curMonth=urlM||(n.getFullYear()+\'-\'+String(n.getMonth()+1).padStart(2,\'0\'));
+
+async function load(autoAdvance){
+  try{
+    const r=await fetch(\'/calendar/data?key=\'+KEY+\'&month=\'+curMonth);
+    const d=await r.json();
+    data=d.posts||{};
+    const total=Object.values(data).reduce((s,a)=>s+(Array.isArray(a)?a.length:0),0);
+    // Si no hay datos y no se especificó mes en la URL, avanzar automáticamente al siguiente mes (una sola vez)
+    if(total===0&&!autoAdvance&&!new URLSearchParams(location.search).get(\'month\')){
+      changeMonth(1,true);
+      return;
+    }
+    renderTabs(d.brands||[]);
+    renderCal();
+    renderAgenda();
+    renderExtras();
+  }catch(e){console.error(e)}
+}
+
+function renderTabs(brands){
+  const c=document.getElementById(\'brand-tabs\');
+  c.innerHTML=\'\';
+  const all=document.createElement(\'div\');
+  all.className=\'brand-tab\';all.dataset.brand=\'all\';
+  all.style.cssText=\'border-color:#1e293b;background:#1e293b;color:white\';
+  all.textContent=\'Todas\';all.onclick=()=>filter(\'all\');c.appendChild(all);
+  brands.forEach(b=>{
+    const t=document.createElement(\'div\');
+    t.className=\'brand-tab\';t.dataset.brand=b;
+    t.style.cssText=\'border-color:\'+(BC[b]||\'#666\')+\';color:\'+(BC[b]||\'#666\');
+    t.textContent=b;t.onclick=()=>filter(b);c.appendChild(t);
+  });
+}
+
+function filter(b){
+  active=b;
+  document.querySelectorAll(\'.brand-tab\').forEach(t=>{
+    const tb=t.dataset.brand,col=tb===\'all\'?\'#1e293b\':(BC[tb]||\'#666\');
+    if(tb===b){t.style.background=col;t.style.color=\'white\';}
+    else{t.style.background=\'white\';t.style.color=col;}
+  });
+  renderCal();renderAgenda();renderExtras();
+}
+
+function monthDates(){
+  const[y,m]=curMonth.split(\'-\').map(Number);
+  const dates=[];
+  const last=new Date(y,m,0).getDate();
+  for(let d=1;d<=last;d++){
+    const dt2=new Date(y,m-1,d);
+    if(dt2.getDay()>=1&&dt2.getDay()<=5)dates.push(dt2);
+  }
+  return dates;
+}
+
+function fmt(d){return d.getFullYear()+\'-\'+String(d.getMonth()+1).padStart(2,\'0\')+\'-\'+String(d.getDate()).padStart(2,\'0\')}
+
+function renderCal(){
+  const[y,m]=curMonth.split(\'-\').map(Number);
+  document.getElementById(\'month-lbl\').textContent=MN[m-1]+\' \'+y;
+  const body=document.getElementById(\'cal-body\');
+  body.innerHTML=\'\';
+  const dates=monthDates();
+  const weeks={};
+  dates.forEach(d=>{const wk=Math.ceil(d.getDate()/7);if(!weeks[wk])weeks[wk]={};weeks[wk][d.getDay()]=d;});
+  Object.keys(weeks).sort((a,b)=>a-b).forEach((wk,wi)=>{
+    const w=weeks[wk];
+    const lbl=document.createElement(\'div\');lbl.className=\'week-lbl\';lbl.textContent=\'S\'+(wi+1);
+    body.appendChild(lbl);
+    for(let dow=1;dow<=5;dow++){
+      const cell=document.createElement(\'div\');cell.className=\'day-cell\';
+      if(w[dow]){
+        const d=w[dow];const ds=fmt(d);
+        const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=d.getDate();
+        cell.appendChild(dn);
+        getForDate(ds).forEach(p=>cell.appendChild(mkChip(p)));
+        if([1,3,5].includes(dow)){const ab=document.createElement(\'div\');ab.className=\'add-btn\';ab.innerHTML=\'+\';ab.title=\'Agregar\';ab.onclick=()=>openNew(ds);cell.appendChild(ab);}
+      }else{cell.className+=\' inactive\';}
+      body.appendChild(cell);
+    }
+  });
+}
+
+function getForDate(ds){
+  const posts=[];
+  for(const[brand,bp] of Object.entries(data)){
+    if(active!==\'all\'&&brand!==active)continue;
+    if(!Array.isArray(bp))continue;
+    bp.filter(p=>p.date===ds&&![\'LinkedIn\',\'Blog\',\'Email\'].includes(p.type)).forEach(p=>posts.push({...p,brand}));
+  }
+  return posts;
+}
+
+function mkChip(p){
+  const tc=TC[p.type]||\'#666\';const bc=BC[p.brand]||\'#888\';
+  const chip=document.createElement(\'div\');chip.className=\'chip\';
+  chip.style.background=tc+\'18\';chip.style.borderColor=tc+\'30\';
+  const icon=TI[p.type]||\'\';
+  const cpKey=\'pRef_\'+p.id.replace(/[^a-z0-9]/gi,\'_\');window[cpKey]={...p};
+  chip.innerHTML=\'<div class="chip-dot" style="background:\'+bc+\'"></div>\'
+    +\'<span class="chip-title">\'+(p.titulo||p.type)+\'</span>\'
+    +\'<span class="chip-icon">\'+icon+\'</span>\'
+    +\'<button class="btn-regen" style="font-size:11px;padding:1px 3px" title="Regenerar" onclick="openRegen(\'+cpKey+\',event)">🔄</button>\'
+    +\'<div class="chip-status" style="background:\'+(SC[p.status]||\'#94a3b8\')+\'"></div>\';
+  chip.onclick=()=>openPost(p);return chip;
+}
+
+function renderExtras(){
+  const c=document.getElementById(\'extras\');c.innerHTML=\'\';
+  [\'LinkedIn\',\'Blog\',\'Email\'].forEach(type=>{
+    const posts=[];
+    for(const[brand,bp] of Object.entries(data)){
+      if(active!==\'all\'&&brand!==active)continue;
+      if(!Array.isArray(bp))continue;
+      bp.filter(p=>p.type===type).forEach(p=>posts.push({...p,brand}));
+    }
+    if(!posts.length)return;
+    const col=TC[type]||\'#666\';const icon=TI[type]||\'\';
+    const h=document.createElement(\'h3\');h.innerHTML=icon+\' \'+type+\' del mes\';h.style.color=col;
+    c.appendChild(h);
+    const grid=document.createElement(\'div\');grid.className=\'cards-grid\';
+    posts.forEach(p=>{
+      const bc=BC[p.brand]||\'#666\';const sc2=SC[p.status]||\'#94a3b8\';
+      const card=document.createElement(\'div\');card.className=\'card\';
+      card.style.borderLeftColor=col;
+      card.innerHTML=\'<div class="card-top"><span class="card-brand" style="color:\'+bc+\'">\'+p.brand+\'</span>\'
+        +\'<div style="display:flex;align-items:center;gap:6px">\'
+        +\'<button class="btn-regen" title="Regenerar con IA" onclick="openRegen(pRef_\'+p.id.replace(/[^a-z0-9]/gi,\'_\')+\',event)">🔄</button>\'
+        +\'<span class="status-pill" style="background:\'+sc2+\'20;color:\'+sc2+\'">\'+( p.status||\'pendiente\')+\'</span></div></div>\'
+        +\'<div class="card-title">\'+(p.titulo||\'Sin título\')+\'</div>\'
+        +\'<div class="card-meta">\'+(p.pilar||\'\')+\' \'+(p.objetivo?\'· \'+p.objetivo:\'\')+\'</div>\';
+      // Store post ref so onclick in innerHTML can access it
+      const pKey=\'pRef_\'+p.id.replace(/[^a-z0-9]/gi,\'_\');
+      window[pKey]={...p};
+      card.onclick=()=>openPost(p);grid.appendChild(card);
+    });
+    c.appendChild(grid);
+  });
+}
+
+function renderAgenda(){
+  const c=document.getElementById(\'agenda\');if(!c)return;
+  c.innerHTML=\'\';
+  const[y,m]=curMonth.split(\'-\').map(Number);
+  const dates=monthDates();
+  let hasAny=false;
+  dates.forEach(d=>{
+    const ds=fmt(d);
+    const posts=getForDate(ds);
+    if(!posts.length)return;
+    hasAny=true;
+    const block=document.createElement(\'div\');block.className=\'agenda-day\';
+    const dow=[\'Dom\',\'Lun\',\'Mar\',\'Mié\',\'Jue\',\'Vie\',\'Sáb\'][d.getDay()];
+    const dateDiv=document.createElement(\'div\');dateDiv.className=\'agenda-date\';
+    dateDiv.textContent=dow+\' \'+d.getDate()+\'/\'+m;
+    block.appendChild(dateDiv);
+    posts.forEach(p=>{
+      const tc=TC[p.type]||\'#666\';const bc=BC[p.brand]||\'#888\';
+      const pKey=\'pRef_\'+p.id.replace(/[^a-z0-9]/gi,\'_\');window[pKey]={...p};
+      const row=document.createElement(\'div\');row.className=\'agenda-row\';
+      row.style.borderLeftColor=tc;
+      row.innerHTML=\'<span class="agenda-type" style="color:\'+tc+\'">\'+( TI[p.type]||\'\')+\' \'+p.type+\'</span>\'
+        +\'<span class="agenda-brand" style="color:\'+bc+\'">\'+p.brand+\'</span>\'
+        +\'<span class="agenda-title">\'+(p.titulo||\'\')+\'</span>\'
+        +\'<div class="chip-status" style="background:\'+(SC[p.status]||\'#94a3b8\')+\';width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-right:4px"></div>\'
+        +\'<button class="btn-regen" style="font-size:14px;padding:2px 4px;flex-shrink:0" title="Regenerar" onclick="event.stopPropagation();openRegen(\'+pKey+\',event)">🔄</button>\';
+      row.onclick=()=>openPost(p);
+      block.appendChild(row);
+    });
+    c.appendChild(block);
+  });
+  if(!hasAny){c.innerHTML=\'<div class="empty-msg">Sin contenido para este mes</div>\';}
+}
+
+function openPost(p){
+  curPost={...p};
+  const tc=TC[p.type]||\'#666\';const bc2=BC[p.brand]||\'#666\';
+  document.getElementById(\'modal-title\').innerHTML=
+    \'<span style="color:\'+bc2+\'">\'+p.brand+\'</span> &middot; \'
+    +\'<span style="color:\'+tc+\'">\'+( TI[p.type]||\'\')+\' \'+p.type+\'</span>\'
+    +(p.date?\' &middot; <span style="color:#94a3b8">\'+p.date+\'</span>\':\'\'  );
+  document.getElementById(\'modal-body\').innerHTML=
+    \'<label>T&iacute;tulo / Tema</label><input id="e-titulo" value="\'+esc(p.titulo||\'\')+\'">\'
+    +\'<label>Pilar de contenido</label><input id="e-pilar" value="\'+esc(p.pilar||\'\')+\'">\'
+    +\'<label>Objetivo</label><input id="e-objetivo" value="\'+esc(p.objetivo||\'\')+\'">\'
+    +\'<label>&#127912; Texto de imagen / Descripci&oacute;n de pieza</label><textarea id="e-texto-imagen" style="min-height:90px;font-family:monospace;font-size:12px">\'+esc(p.texto_imagen||\'\')+\'</textarea>\'
+    +\'<label>Copy (caption para redes)</label><textarea id="e-copy">\'+esc(p.copy||\'\')+\'</textarea>\'
+    +(p.hashtags!==undefined?\'<label>Hashtags</label><input id="e-hashtags" value="\'+esc(p.hashtags||\'\')+\'">\':\'\')
+    +\'<label>Estado</label><select id="e-status">\'
+    +\'<option value="pendiente"\'+(p.status===\'pendiente\'?\' selected\':\'\')+\'>&#9203; Pendiente</option>\'
+    +\'<option value="aprobado"\'+(p.status===\'aprobado\'?\' selected\':\'\')+\'>&#10003; Aprobado</option>\'
+    +\'<option value="con_cambios"\'+(p.status===\'con_cambios\'?\' selected\':\'\')+\'>&#8635; Con cambios</option>\'
+    +\'</select>\'
+    +\'<label>Comentarios</label><textarea id="e-comments" style="min-height:60px">\'+esc(p.comments||\'\')+\'</textarea>\'
+    +\'<div class="modal-actions"><button class="btn-save" onclick="savePost()">&#128190; Guardar</button>\'
+    +\'<button class="btn-cancel" onclick="closeModal()">Cancelar</button></div>\';
+  document.getElementById(\'overlay\').classList.remove(\'hidden\');
+}
+
+function openNew(ds){
+  openPost({id:\'new-\'+Date.now(),brand:active!==\'all\'?active:\'EBDS\',date:ds,type:\'Post\',titulo:\'\',pilar:\'\',objetivo:\'\',texto_imagen:\'\',copy:\'\',hashtags:\'\',status:\'pendiente\',comments:\'\'});
+}
+
+async function savePost(){
+  const p={...curPost,
+    titulo:document.getElementById(\'e-titulo\').value,
+    pilar:document.getElementById(\'e-pilar\').value,
+    objetivo:document.getElementById(\'e-objetivo\').value,
+    texto_imagen:document.getElementById(\'e-texto-imagen\').value,
+    copy:document.getElementById(\'e-copy\').value,
+    status:document.getElementById(\'e-status\').value,
+    comments:document.getElementById(\'e-comments\').value
+  };
+  const eh=document.getElementById(\'e-hashtags\');if(eh)p.hashtags=eh.value;
+  try{
+    const r=await fetch(\'/calendar/save?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post:p})});
+    if(r.ok){
+      if(!data[p.brand])data[p.brand]=[];
+      const idx=data[p.brand].findIndex(x=>x.id===p.id);
+      if(idx>=0)data[p.brand][idx]=p;else data[p.brand].push(p);
+      closeModal();renderCal();renderExtras();
+    }
+  }catch(e){alert(\'Error al guardar\');}
+}
+
+function closeModal(){document.getElementById(\'overlay\').classList.add(\'hidden\');}
+document.getElementById(\'overlay\').onclick=e=>{if(e.target.id===\'overlay\')closeModal();};
+
+// ── Regenerate modal ────────────────────────────────────────────────────
+let regenPost=null;
+function openRegen(p,e){
+  e.stopPropagation();
+  regenPost={...p};
+  const tc=TC[p.type]||\'#6366f1\';
+  document.getElementById(\'regen-title\').textContent=\'🔄 Regenerar: \'+(p.titulo||p.type)+\' · \'+(p.date||\'\');
+  document.getElementById(\'regen-subtitle\').textContent=p.brand+\' · \'+(p.type||\'\')+(p.pilar?\' · \'+p.pilar:\'\');
+  document.getElementById(\'regen-instr\').value=\'\';
+  document.getElementById(\'regen-go\').disabled=false;
+  document.getElementById(\'regen-go\').textContent=\'🔄 Regenerar\';
+  document.getElementById(\'regen-spinner\').classList.remove(\'show\');
+  document.getElementById(\'regen-overlay\').classList.add(\'show\');
+}
+function closeRegen(){document.getElementById(\'regen-overlay\').classList.remove(\'show\');}
+document.getElementById(\'regen-overlay\').onclick=e=>{if(e.target.id===\'regen-overlay\')closeRegen();};
+
+async function doRegen(){
+  if(!regenPost)return;
+  const instr=document.getElementById(\'regen-instr\').value.trim();
+  const btn=document.getElementById(\'regen-go\');
+  btn.disabled=true;btn.textContent=\'Generando...\';
+  document.getElementById(\'regen-spinner\').classList.add(\'show\');
+  try{
+    const r=await fetch(\'/calendar/regenerate-post?key=\'+KEY,{
+      method:\'POST\',
+      headers:{\'Content-Type\':\'application/json\'},
+      body:JSON.stringify({month:curMonth,post_id:regenPost.id,instruction:instr})
+    });
+    if(r.ok){
+      const newPost=await r.json();
+      // Update local data
+      if(data[newPost.brand]){
+        const idx=data[newPost.brand].findIndex(x=>x.id===newPost.id);
+        if(idx>=0)data[newPost.brand][idx]=newPost;
+      }
+      closeRegen();
+      renderCal();renderExtras();
+      // Flash success
+      btn.textContent=\'✅ Listo\';
+    } else {
+      btn.textContent=\'❌ Error — reintenta\';btn.disabled=false;
+    }
+  }catch(e){
+    btn.textContent=\'❌ Error de red\';btn.disabled=false;
+  }
+  document.getElementById(\'regen-spinner\').classList.remove(\'show\');
+}
+
+function changeMonth(d,autoAdvance){
+  const[y,m]=curMonth.split(\'-\').map(Number);
+  const nd=new Date(y,m-1+d,1);
+  curMonth=nd.getFullYear()+\'-\'+String(nd.getMonth()+1).padStart(2,\'0\');
+  const url=new URL(location);url.searchParams.set(\'month\',curMonth);history.pushState({},\'\',url);
+  load(autoAdvance);
+}
+
+function esc(s){return String(s).replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\').replace(/"/g,\'&quot;\').replace(/\'/g,\'&#39;\');}
+
+if(document.readyState===\'loading\'){document.addEventListener(\'DOMContentLoaded\',load);}else{load();}
+</script>
+
+<div class="regen-overlay" id="regen-overlay">
+  <div class="regen-modal">
+    <h3 id="regen-title">Regenerar post</h3>
+    <p id="regen-subtitle" style="font-weight:500;color:#475569;margin-bottom:4px"></p>
+    <p>Dejá en blanco para una versión diferente automática, o escribí una instrucción:</p>
+    <textarea id="regen-instr" placeholder="Ej: enfocado en casos de éxito, tono más emocional, hablando del precio..."></textarea>
+    <div class="regen-spinner" id="regen-spinner">⏳</div>
+    <div class="regen-actions">
+      <button class="btn-regen-go" id="regen-go" onclick="doRegen()">🔄 Regenerar</button>
+      <button class="btn-cancel" onclick="closeRegen()">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>'''
+
+
+# --- Flask routes ---
+@app.route('/', methods=['GET'])
+def health():
+    return Response('Marketing Agent Bot running!', status=200)
+
+@app.route('/debug/zoho-ebds')
+def debug_zoho_ebds():
+    """Testea conexión EBDS CRM y muestra estructura de datos."""
+    out = {}
+    try:
+        # Test token
+        token = zoho_get_token('ebds')
+        out['token_ok'] = bool(token)
+        # Primeros 3 Leads
+        leads = zoho_get('Leads', {'per_page': 3, 'fields': 'Lead_Status,Lead_Source,Created_Time,Last_Name,Email'}, client='ebds')
+        out['leads_sample'] = leads.get('data', [])
+        out['leads_fields'] = list(leads.get('data', [{}])[0].keys()) if leads.get('data') else []
+        # Primeros 3 Deals
+        deals = zoho_get('Deals', {'per_page': 3}, client='ebds')
+        out['deals_sample_fields'] = list(deals.get('data', [{}])[0].keys()) if deals.get('data') else []
+        out['deals_stages_sample'] = [d.get('Stage') for d in deals.get('data', [])]
+    except Exception as e:
+        out['error'] = str(e)
+    return Response(json.dumps(out, indent=2, ensure_ascii=False), mimetype='application/json')
+
+@app.route('/debug/validar')
+def debug_validar():
+    """Diagnostica el check_validar: qué tareas hay en cada workspace."""
+    out = {}
+    for ws_id, ws_info in WORKSPACES.items():
+        ws_result = {'name': ws_info['name'], 'tasks': [], 'error': None}
+        try:
+            # Intentar con statuses[]=validar
+            r1 = cu_get(f'team/{ws_id}/task?statuses[]=validar&subtasks=true')
+            ws_result['tasks_in_validar'] = len(r1.get('tasks', []))
+            ws_result['sample'] = [
+                {'id': t['id'], 'name': t['name'][:50],
+                 'status': t.get('status', {}).get('status', '?'),
+                 'assignees': [a.get('email', '') for a in t.get('assignees', [])]}
+                for t in r1.get('tasks', [])[:5]
+            ]
+            # También traer primeras 5 tareas sin filtro de status para verificar que el workspace es correcto
+            r2 = cu_get(f'team/{ws_id}/task?subtasks=true&page=0')
+            ws_result['total_tasks_sample'] = [
+                {'name': t['name'][:40], 'status': t.get('status', {}).get('status', '?')}
+                for t in r2.get('tasks', [])[:5]
+            ]
+        except Exception as e:
+            ws_result['error'] = str(e)
+        out[ws_id] = ws_result
+    out['sofia_email_filter'] = SOFIA_CLICKUP_EMAIL
+    out['notified_count'] = len(read_state().get('notified_validar_tasks', []))
+    return Response(json.dumps(out, indent=2, ensure_ascii=False), mimetype='application/json')
+
+@app.route('/debug')
+def debug_route():
+    results = {}
+    # Test ClickUp read
+    try:
+        task = cu_get(f'task/{STATE_TASK_ID}')
+        results['clickup_read'] = 'ok — ' + str(task.get('name','?'))[:40]
+    except Exception as e:
+        results['clickup_read'] = f'ERROR: {e}'
+    # Test ClickUp write — read state and write it back unchanged (non-destructive)
+    try:
+        task = cu_get(f'task/{STATE_TASK_ID}')
+        existing_desc = task.get('description', '') or ''
+        cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': existing_desc})
+        results['clickup_write'] = 'ok'
+    except Exception as e:
+        results['clickup_write'] = f'ERROR: {e}'
+    # Test Telegram
+    try:
+        http_req(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe')
+        results['telegram'] = 'ok'
+    except Exception as e:
+        results['telegram'] = f'ERROR: {e}'
+    # Token hints (first/last 4 chars only)
+    cu_tok = CLICKUP_TOKEN
+    tg_tok = TELEGRAM_TOKEN
+    results['clickup_token_hint'] = f'{cu_tok[:6]}...{cu_tok[-4:]}' if len(cu_tok) > 10 else 'short?'
+    results['telegram_token_hint'] = f'{tg_tok[:6]}...{tg_tok[-4:]}' if len(tg_tok) > 10 else 'short?'
+    return Response(json.dumps(results, indent=2), mimetype='application/json')
+
+@app.route('/webhook', methods=['POST'])
+def webhook_post():
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        msg = body.get('message', {})
+        if msg and msg.get('chat', {}).get('id') == SOFIA_CHAT_ID:
+            text = msg.get('text', '').strip()
+            if text:
+                try:
+                    state = read_state()
+                except Exception as e:
+                    print(f'read_state error: {e}')
+                    state = {'last_offset': 0, 'notified_validar_tasks': [], 'active_conversation': None, 'pending_approvals': []}
+                try:
+                    state = process(text, state)
+                except Exception as e:
+                    print(f'process error [{text[:40]}]: {e}')
+                    return Response('OK', status=200)
+                trigger_calendar = state.pop('_trigger_calendar', False)
+                try:
+                    save_state(state)
+                except Exception as e:
+                    print(f'save_state error: {e}')
+                # Disparar /calendar/generate DESPUÉS de guardar el estado
+                if trigger_calendar:
+                    try:
+                        req = urllib.request.Request(
+                            'https://vercel-deploy-tan-one.vercel.app/calendar/generate',
+                            data=b'', method='POST'
+                        )
+                        urllib.request.urlopen(req, timeout=3)
+                    except Exception:
+                        pass  # timeout/error esperado — generate sigue corriendo
+    except Exception as e:
+        print(f'webhook error: {e}')
+    return Response('OK', status=200)
+
+@app.route('/cron/check-validar', methods=['GET', 'POST'])
+def cron_check_validar():
+    try:
+        state = read_state()
+        state = check_validar(state)
+        save_state(state)
+    except Exception as e:
+        print(f'Validar cron error: {e}')
+    return Response('OK', status=200)
+
+@app.route('/cron/check-posts', methods=['GET', 'POST'])
+def cron_check_posts():
+    try:
+        state = read_state()
+        state = check_new_posts(state)
+        save_state(state)
+    except Exception as e:
+        print(f'Check posts error: {e}')
+    return Response('OK', status=200)
+
+@app.route('/calendar/generate', methods=['GET', 'POST'])
+def calendar_generate():
+    """Procesa UNA marca pendiente del calendario por llamada. Llamar cada 2 min desde cron-job.org."""
+    try:
+        state = read_state()
+        pending = state.get('pending_calendar')
+        if not pending:
+            return Response('no pending', status=200)
+
+        brands    = pending['brands']
+        idx       = pending.get('idx', 0)
+        month_str = pending['month_str']
+        month_label = pending.get('month_label', month_str)
+
+        if idx >= len(brands):
+            # Todas las marcas listas
+            key = os.environ.get('CALENDAR_KEY', 'sofia2026mkt')
+            calendar_data = get_calendar_data(month_str)
+            total = sum(len(v) for v in calendar_data.values())
+            tg_send(
+                f'✅ *Calendario {month_label} listo\\!*\n\n'
+                f'📊 {total} piezas generadas\n'
+                f'🏢 {", ".join(brands)}\n\n'
+                f'🔗 https://vercel-deploy-tan-one.vercel.app/calendar?key={key}&month={month_str}'
+            )
+            del state['pending_calendar']
+            save_state(state)
+            return Response('done', status=200)
+
+        brand = brands[idx]
+        tg_send(f'⏳ Generando *{brand}*... ({idx+1}/{len(brands)})')
+
+        try:
+            year, mo = int(month_str[:4]), int(month_str[5:])
+            posting_dates = get_posting_dates(year, mo)
+            assignments   = assign_formats(brands, posting_dates)
+            calendar_data = state.get('calendar', {}).get(month_str) or {}
+
+            slots = [(d, brands_day[brand]) for d, brands_day in sorted(assignments.items()) if brand in brands_day]
+            social   = generate_social_posts(brand, month_label, slots)
+            li_count = 4 if brand == 'ZoWeAre' else 3
+            linkedin = generate_linkedin_posts(brand, month_label, li_count)
+            blog     = [] if brand == 'ZoWeAre' else generate_blog_posts(brand, month_label, 2)
+            emails   = [] if brand == 'ZoWeAre' else generate_email_posts(brand, month_label, 3)
+
+            calendar_data[brand] = social + linkedin + blog + emails
+            # Merge en el state actual y avanzar idx — un solo save_state al final
+            state = merge_calendar_into_state(state, month_str, calendar_data)
+            tg_send(f'✅ *{brand}* generado — {len(social)} posts · {len(linkedin)} LinkedIn · {len(blog)} blog · {len(emails)} emails')
+        except Exception as e:
+            print(f'Calendar gen {brand}: {e}')
+            tg_send(f'⚠️ Error generando {brand}: {str(e)[:100]}')
+
+        pending['idx'] = idx + 1
+        state['pending_calendar'] = pending
+        save_state(state)  # único save que incluye calendar + pending actualizado
+    except Exception as e:
+        print(f'calendar_generate error: {e}')
+    return Response('OK', status=200)
+
+
+@app.route('/cron/seo-report', methods=['GET', 'POST'])
+def cron_seo_report():
+    if not is_first_business_day():
+        return Response('Not first business day — skipping.', status=200)
+    try:
+        run_seo_reports()
+    except Exception as e:
+        print(f'SEO report error: {e}')
+        tg_send(f'❌ Error en reporte SEO: {str(e)[:150]}')
+    return Response('OK', status=200)
+
+@app.route('/calendar')
+def calendar_page():
+    key = request.args.get('key', '')
+    expected = os.environ.get('CALENDAR_KEY', 'sofia2026mkt')
+    if key != expected:
+        return Response('<h2>Acceso no autorizado</h2>', status=401, mimetype='text/html')
+    # Si no hay ?month= en la URL, detectar el mes con datos más próximo y redirigir
+    if not request.args.get('month'):
+        from flask import redirect
+        state = read_state()
+        cal = state.get('calendar', {})
+        today = dt.date.today()
+        # Buscar en los próximos 6 meses
+        for delta in range(0, 7):
+            d = today.replace(day=1) + dt.timedelta(days=32 * delta)
+            ms = f'{d.year}-{str(d.month).zfill(2)}'
+            if ms in cal and any(cal[ms].get(b) for b in CALENDAR_BRANDS):
+                return redirect(f'/calendar?key={key}&month={ms}')
+    return Response(CALENDAR_HTML, mimetype='text/html')
+
+@app.route('/calendar/data')
+def calendar_data_route():
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('{}', status=401, mimetype='application/json')
+    month_str = request.args.get('month', dt.date.today().strftime('%Y-%m'))
+    month_data = get_calendar_data(month_str)
+    brands = [b for b in CALENDAR_BRANDS if b in month_data]
+    return Response(json.dumps({'posts': month_data, 'brands': brands}, ensure_ascii=False), mimetype='application/json')
+
+@app.route('/calendar/save', methods=['POST'])
+def calendar_save_route():
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    body = request.get_json() or {}
+    month_str = body.get('month')
+    post = body.get('post')
+    if not month_str or not post:
+        return Response('Bad request', status=400)
+    month_data = get_calendar_data(month_str) or {}
+    brand = post.get('brand', '')
+    if brand:
+        if brand not in month_data:
+            month_data[brand] = []
+        idx = next((i for i, p in enumerate(month_data[brand]) if p.get('id') == post.get('id')), -1)
+        if idx >= 0:
+            month_data[brand][idx] = post
+        else:
+            month_data[brand].append(post)
+    save_calendar_data(month_str, month_data)
+    return Response('OK', status=200)
+
+@app.route('/calendar/regenerate-post', methods=['POST'])
+def calendar_regenerate_post_route():
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    body = request.get_json() or {}
+    month_str   = body.get('month')
+    post_id     = body.get('post_id')
+    instruction = body.get('instruction', '').strip()
+    if not month_str or not post_id:
+        return Response('Bad request', status=400)
+    month_data = get_calendar_data(month_str) or {}
+    # Find the post
+    found_post = None
+    found_brand = None
+    for brand, posts in month_data.items():
+        for p in posts:
+            if p.get('id') == post_id:
+                found_post = p
+                found_brand = brand
+                break
+        if found_post:
+            break
+    if not found_post:
+        return Response('Post not found', status=404)
+    try:
+        new_post = regenerate_single_post(found_post, instruction)
+        if new_post:
+            for i, p in enumerate(month_data[found_brand]):
+                if p.get('id') == post_id:
+                    month_data[found_brand][i] = new_post
+                    break
+            save_calendar_data(month_str, month_data)
+            return Response(json.dumps(new_post, ensure_ascii=False), mimetype='application/json')
+    except Exception as e:
+        print(f'Regenerate post error: {e}')
+    return Response('Error generating post', status=500)
+
+
+# ─── PAID MEDIA MONTHLY REPORT ──────────────────────────────────────
+
+REPORT_OBJECTIVES = {
+    'BHU/UIN': {'leads': 1050, 'ventas': 24},
+    'EBDS':    {'leads': 600,  'ventas': 10},
+}
+
+def calculate_curva(month_date=None):
+    """% días hábiles (Lun–Sáb) transcurridos en el mes."""
+    if month_date is None:
+        month_date = dt.date.today()
+    today = dt.date.today()
+    first = month_date.replace(day=1)
+    if month_date.month == 12:
+        last = month_date.replace(day=31)
+    else:
+        last = month_date.replace(month=month_date.month + 1, day=1) - dt.timedelta(days=1)
+    total_w = elapsed_w = 0
+    d = first
+    while d <= last:
+        if d.weekday() < 6:   # 0=Lun … 5=Sáb
+            total_w += 1
+            if d <= today:
+                elapsed_w += 1
+        d += dt.timedelta(days=1)
+    pct = round(elapsed_w / total_w * 100, 1) if total_w else 0
+    return elapsed_w, total_w, pct
+
+def fetch_meta_monthly(is_ebds=False, month_date=None):
+    """Datos Meta Ads desde día 1 del mes hasta hoy, nivel adset."""
+    if month_date is None:
+        month_date = dt.date.today()
+    today = dt.date.today()
+    tr = json.dumps({'since': month_date.replace(day=1).isoformat(), 'until': today.isoformat()})
+    fields = 'campaign_name,adset_name,spend,impressions,clicks,ctr,cpm,cpc,reach,actions,cost_per_action_type'
+    url = (f'https://graph.facebook.com/v21.0/act_2249213495344845/insights'
+           f'?fields={urllib.parse.quote(fields)}&time_range={urllib.parse.quote(tr)}'
+           f'&level=adset&limit=100&access_token={META_TOKEN}')
+    try:
+        rows = http_req(url).get('data', [])
+    except Exception as e:
+        print(f'fetch_meta_monthly error: {e}')
+        rows = []
+    if is_ebds:
+        return [r for r in rows if 'ebds' in r.get('campaign_name', '').lower()]
+    else:
+        return [r for r in rows if 'ebds' not in r.get('campaign_name', '').lower()]
+
+def _leads(row):
+    return sum(int(a.get('value', 0)) for a in (row.get('actions') or [])
+               if a.get('action_type') in ('lead', 'onsite_conversion.lead_grouped'))
+
+def _is_remark(cn, an=''):
+    t = (cn + ' ' + an).lower()
+    return any(w in t for w in ['retargeting', 'remarketing', ' rtg', ' rtgt', 'remarket'])
+
+def _norm_prog(s):
+    s = s.lower()
+    s = re.sub(r'^(ebds|uin|bhu|behind[-\s]u)\s*[-–:]\s*', '', s)
+    s = re.sub(r'\b(leads?|clientes? potenciales?|retargeting|remarketing|rtg|rtgt|'
+               r'prospecting|prosp|conversiones?|tr[a\xe1]fico|awareness|branding)\b', '', s)
+    s = re.sub(r'[^a-z\xe1\xe9\xed\xf3\xfa\xfc\xf1\s]', ' ', s)
+    return ' '.join(s.split())
+
+def _fuzzy_prog(adset_name, crm_progs):
+    w1 = {w for w in _norm_prog(adset_name).split() if len(w) > 3}
+    best, bsc = None, 0
+    for p in crm_progs:
+        w2 = {w for w in _norm_prog(p).split() if len(w) > 3}
+        if not w1 or not w2:
+            continue
+        sc = len(w1 & w2) / max(len(w1), len(w2))
+        if sc > bsc:
+            bsc, best = sc, p
+    return (best, bsc) if bsc >= 0.3 else (None, 0)
+
+def _sum_rows(rows):
+    sp  = sum(float(r.get('spend', 0)) for r in rows)
+    ld  = sum(_leads(r) for r in rows)
+    imp = sum(int(r.get('impressions', 0)) for r in rows)
+    cl  = sum(int(r.get('clicks', 0)) for r in rows)
+    cpl = sp / ld  if ld  else 0
+    ctr = cl / imp * 100 if imp else 0
+    cpm = sp / imp * 1000 if imp else 0
+    return sp, ld, imp, cl, cpl, ctr, cpm
+
+def _kc(val, target):
+    if not target: return ''
+    if val >= target:        return 'ok'
+    if val >= target * 0.7:  return 'warn'
+    return 'bad'
+
+
+def build_paid_media_html(client_name, meta_data, crm_data, month_date):
+    today      = dt.date.today()
+    is_ebds    = (client_name == 'EBDS')
+    obj        = REPORT_OBJECTIVES.get(client_name, {'leads': 1000, 'ventas': 20})
+    elapsed_d, total_d, curva_pct = calculate_curva(month_date)
+
+    MESES = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio',
+             'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre']
+    month_es   = MESES[month_date.month]
+    period_str = f'1 al {today.day} de {month_es} {today.year}'
+
+    # ── Meta split ──────────────────────────────────────────────────
+    prospc = [r for r in meta_data if not _is_remark(r.get('campaign_name',''), r.get('adset_name',''))]
+    remar  = [r for r in meta_data if     _is_remark(r.get('campaign_name',''), r.get('adset_name',''))]
+
+    t_sp, t_ld, t_imp, t_cl, t_cpl, t_ctr, t_cpm = _sum_rows(meta_data)
+    p_sp, p_ld,  _,     _,    p_cpl, p_ctr, _     = _sum_rows(prospc)
+    r_sp, r_ld,  _,     _,    r_cpl, r_ctr, _     = _sum_rows(remar)
+
+    # Campaigns group
+    camps = {}
+    for row in prospc:
+        cn = row.get('campaign_name', 'Sin campaña')
+        camps.setdefault(cn, {'adsets': [], 'spend': 0, 'leads': 0, 'impressions': 0, 'clicks': 0})
+        camps[cn]['adsets'].append(row)
+        camps[cn]['spend']       += float(row.get('spend', 0))
+        camps[cn]['leads']       += _leads(row)
+        camps[cn]['impressions'] += int(row.get('impressions', 0))
+        camps[cn]['clicks']      += int(row.get('clicks', 0))
+
+    # ── CRM ──────────────────────────────────────────────────────────
+    f           = (crm_data or {}).get('funnel', {})
+    contactados = f.get('contactados', 0)
+    interesados = f.get('interesados', 0)
+    evaluando   = f.get('evaluando', 0)
+    promesa     = f.get('promesa_pago', 0)
+    estudiantes = f.get('estudiantes', 0)
+    perdidos    = f.get('perdidos', 0)
+
+    mql    = contactados + interesados + evaluando + promesa + estudiantes + perdidos
+    sql    = contactados + interesados + evaluando + promesa
+    ventas = estudiantes
+
+    leads_pct   = t_ld   / obj['leads']  * 100 if obj['leads']  else 0
+    ventas_pct  = ventas / obj['ventas'] * 100 if obj['ventas'] else 0
+    mql_rate    = mql / t_ld * 100 if t_ld else 0
+    sql_rate    = sql / t_ld * 100 if t_ld else 0
+    leads_pace  = leads_pct  / curva_pct * 100 if curva_pct else 0
+    ventas_pace = ventas_pct / curva_pct * 100 if curva_pct else 0
+
+    def fc(v, d=0): return f'${v:,.{d}f}' if v else '—'
+    def fn(v):      return f'{int(v):,}' if v else '—'
+    def fp(v, d=1): return f'{v:.{d}f}%'
+
+    def pace_badge(pace):
+        if pace >= 95:  return '<span class="pill pill-ok">✓ On track</span>'
+        if pace >= 70:  return '<span class="pill pill-new">⚠ Por detr\xe1s</span>'
+        return '<span class="pill pill-bad">✗ En riesgo</span>'
+
+    # ── Programs cross-reference ─────────────────────────────────────
+    top_progs = (crm_data or {}).get('top_programas', {})
+    prog_meta = {}
+    for row in prospc:
+        an   = row.get('adset_name', '')
+        prog, _ = _fuzzy_prog(an, list(top_progs.keys()))
+        key  = prog if prog else an[:50]
+        prog_meta.setdefault(key, {'spend': 0, 'leads': 0,
+                                   'crm': top_progs.get(prog, 0) if prog else 0,
+                                   'matched': bool(prog)})
+        prog_meta[key]['spend'] += float(row.get('spend', 0))
+        prog_meta[key]['leads'] += _leads(row)
+    for p, cnt in top_progs.items():
+        if p not in prog_meta:
+            prog_meta[p] = {'spend': 0, 'leads': 0, 'crm': cnt, 'matched': False}
+    sorted_progs = sorted(prog_meta.items(), key=lambda x: -(x[1]['spend'] + x[1]['crm'] * 5))[:14]
+
+    # ── Accionables ──────────────────────────────────────────────────
+    acciones = []
+    if leads_pace < 70:
+        acciones.append(('alta',
+            f'Leads por detr\xe1s de curva ({fp(leads_pct)} acumulado vs {fp(curva_pct)} curva). '
+            f'Revis\xe1 presupuesto diario y audiencias.', 'Meta Ads'))
+    elif leads_pace < 90:
+        acciones.append(('media',
+            f'Pace de leads ligeramente por debajo ({fp(leads_pace, 0)} de lo esperado). '
+            f'Monitorear CPL y creativos.', 'Meta Ads'))
+    if t_cpl > 50:
+        acciones.append(('alta', f'CPL total ${t_cpl:.0f} es elevado. Paus\xe1 adsets sin conversiones.', 'Meta Ads'))
+    elif t_cpl > 30:
+        acciones.append(('media', f'CPL ${t_cpl:.0f}. Prob\xe1 creativos con mayor tasa de click→lead.', 'Meta Ads'))
+    for cn, cdata in sorted(camps.items(), key=lambda x: -x[1]['spend'])[:5]:
+        camp_cpl_v = cdata['spend'] / cdata['leads'] if cdata['leads'] else 9999
+        if cdata['leads'] == 0 and cdata['spend'] > 150:
+            acciones.append(('alta',
+                f'"{cn[:55]}" — ${cdata["spend"]:.0f} sin leads. Pausar o revisar p\xfablico.', 'Meta Ads'))
+        elif cdata['leads'] > 0 and camp_cpl_v > t_cpl * 1.6:
+            acciones.append(('media',
+                f'"{cn[:55]}" — CPL ${camp_cpl_v:.0f} ({camp_cpl_v/t_cpl:.1f}x el promedio). '
+                f'Revisar segmentaci\xf3n.', 'Meta Ads'))
+    if sql > 0 and promesa / sql < 0.05:
+        acciones.append(('media',
+            f'Solo {promesa} deals en Promesa de Pago ({promesa/sql*100:.1f}% del pipeline activo). '
+            f'Activar seguimiento en Evaluando ({evaluando}).', 'CRM'))
+    if mql > 0 and perdidos > mql * 0.4:
+        acciones.append(('media',
+            f'{perdidos} perdidos ({perdidos/mql*100:.1f}% del MQL). Analizar motivo de rechazo.', 'CRM'))
+    if ventas_pace < 60:
+        acciones.append(('alta',
+            f'Ventas muy por detr\xe1s de curva ({fp(ventas_pct)} vs {fp(curva_pct)}). '
+            f'Revisar pipeline con ventas.', 'CRM'))
+    if not acciones:
+        acciones.append(('baja', 'Campa\xf1a en buen ritmo. Mantener optimizaci\xf3n semanal de creativos.', 'Meta Ads'))
+
+    # ── Colors ───────────────────────────────────────────────────────
+    primary   = '#1e3a8a' if is_ebds else '#1a4a8a'
+    primary_l = '#e6eef9' if is_ebds else '#e6f1fb'
+    primary_m = '#3b82f6' if is_ebds else '#378ADD'
+    curva_cls = 'ok' if curva_pct >= 80 else ('warn' if curva_pct >= 50 else 'bad')
+
+    # ── Campaigns HTML ───────────────────────────────────────────────
+    def strip_prefix(s):
+        for pfx in ['EBDS - ', 'EBDS- ', 'BHU - ', 'UIN - ', 'Behind-U - ', 'BeU - ']:
+            s = s.replace(pfx, '')
+        return s
+
+    camps_html = ''
+    for cn, cdata in sorted(camps.items(), key=lambda x: -x[1]['spend']):
+        camp_cpl_v = cdata['spend'] / cdata['leads'] if cdata['leads'] else 0
+        camp_ctr   = cdata['clicks'] / cdata['impressions'] * 100 if cdata['impressions'] else 0
+        camps_html += (
+            f'<tr class="camp-row">'
+            f'<td style="font-weight:600;color:#1a1a18" title="{cn}">{strip_prefix(cn)[:60]}</td>'
+            f'<td>{fc(cdata["spend"])}</td>'
+            f'<td>{fn(cdata["leads"]) if cdata["leads"] else "<span class=bad>—</span>"}</td>'
+            f'<td>{fc(camp_cpl_v) if cdata["leads"] else "<span class=bad>—</span>"}</td>'
+            f'<td>{fp(camp_ctr)}</td>'
+            f'<td>{fn(cdata["impressions"])}</td>'
+            f'</tr>'
+        )
+        for a in sorted(cdata['adsets'], key=lambda x: -float(x.get('spend', 0))):
+            a_sp  = float(a.get('spend', 0))
+            a_ld  = _leads(a)
+            a_cpl = a_sp / a_ld if a_ld else 0
+            a_imp = int(a.get('impressions', 0))
+            a_cl  = int(a.get('clicks', 0))
+            a_ctr = a_cl / a_imp * 100 if a_imp else 0
+            an    = a.get('adset_name', '')
+            camps_html += (
+                f'<tr class="adset-row">'
+                f'<td style="padding-left:26px;color:#6b6b66;font-size:11px" title="{an}">'
+                f'⤷ {strip_prefix(an)[:58]}</td>'
+                f'<td style="color:#6b6b66">{fc(a_sp)}</td>'
+                f'<td style="color:#6b6b66">{fn(a_ld) if a_ld else "—"}</td>'
+                f'<td style="color:#6b6b66">{fc(a_cpl) if a_ld else "—"}</td>'
+                f'<td style="color:#6b6b66">{fp(a_ctr)}</td>'
+                f'<td style="color:#6b6b66">{fn(a_imp)}</td>'
+                f'</tr>'
+            )
+    if not camps_html:
+        camps_html = '<tr><td colspan="6" style="text-align:center;color:#9e9e98;padding:20px">Sin datos de campa\xf1as para el per\xedodo</td></tr>'
+
+    # ── Remarketing HTML ─────────────────────────────────────────────
+    remark_html = ''
+    if remar:
+        remark_camps = {}
+        for row in remar:
+            cn = row.get('campaign_name', 'Remarketing')
+            remark_camps.setdefault(cn, {'spend': 0, 'leads': 0})
+            remark_camps[cn]['spend'] += float(row.get('spend', 0))
+            remark_camps[cn]['leads'] += _leads(row)
+        for cn, cdata in sorted(remark_camps.items(), key=lambda x: -x[1]['spend']):
+            r_cpl2 = cdata['spend'] / cdata['leads'] if cdata['leads'] else 0
+            remark_html += (
+                f'<tr>'
+                f'<td style="font-weight:600" title="{cn}">{strip_prefix(cn)[:60]}</td>'
+                f'<td>{fc(cdata["spend"])}</td>'
+                f'<td>{fn(cdata["leads"]) if cdata["leads"] else "—"}</td>'
+                f'<td>{fc(r_cpl2) if cdata["leads"] else "—"}</td>'
+                f'</tr>'
+            )
+    if not remark_html:
+        remark_html = '<tr><td colspan="4" style="text-align:center;color:#9e9e98;padding:16px">Sin campa\xf1as de remarketing en el per\xedodo</td></tr>'
+
+    # ── Programs HTML ────────────────────────────────────────────────
+    progs_html = ''
+    for prog_name, pdata in sorted_progs:
+        p_cpl2    = pdata['spend'] / pdata['leads'] if pdata['leads'] else 0
+        badge_cls = 'pill-ok' if pdata['matched'] else 'pill-new'
+        badge_txt = '✓' if pdata['matched'] else '~'
+        progs_html += (
+            f'<tr>'
+            f'<td><span class="pill {badge_cls}" style="margin-right:6px">{badge_txt}</span>'
+            f'{prog_name[:52]}</td>'
+            f'<td>{fn(pdata["leads"]) if pdata["leads"] else "—"}</td>'
+            f'<td>{fc(pdata["spend"])}</td>'
+            f'<td>{fc(p_cpl2) if pdata["leads"] else "—"}</td>'
+            f'<td>{fn(pdata["crm"]) if pdata["crm"] else "—"}</td>'
+            f'</tr>'
+        )
+    if not progs_html:
+        progs_html = '<tr><td colspan="5" style="text-align:center;color:#9e9e98;padding:16px">Sin datos de programas disponibles</td></tr>'
+
+    # ── Accionables HTML ─────────────────────────────────────────────
+    acc_html = ''
+    for prio, desc, canal in acciones[:6]:
+        pcls = {'alta': 'p-alta', 'media': 'p-media', 'baja': 'p-baja'}[prio]
+        acc_html += (
+            f'<div class="accion-block">'
+            f'<div class="accion-header">'
+            f'<div class="accion-title">{desc}</div>'
+            f'<div class="prioridad {pcls}">{prio.upper()}</div>'
+            f'</div>'
+            f'<div class="accion-canal">\U0001f4cd {canal}</div>'
+            f'</div>'
+        )
+
+    # ── Fuentes CRM ──────────────────────────────────────────────────
+    fuentes_html = ''
+    if crm_data and crm_data.get('leads_por_fuente'):
+        fuentes_html = (
+            '<div class="tbl-wrap" style="margin-top:14px">'
+            '<table class="tbl"><thead><tr><th>Fuente de leads</th><th>Cantidad</th></tr></thead><tbody>'
+        )
+        for k, v in list(crm_data['leads_por_fuente'].items())[:8]:
+            fuentes_html += f'<tr><td>{k}</td><td>{v:,}</td></tr>'
+        fuentes_html += '</tbody></table></div>'
+
+    # ── Remarketing KPI cards ─────────────────────────────────────────
+    remark_kpis = ''
+    if remar:
+        remark_kpis = (
+            f'<div class="kpi-grid-3" style="margin-bottom:14px">'
+            f'<div class="kpi"><div class="kpi-label">INVERSI\xd3N</div>'
+            f'<div class="kpi-val">{fc(r_sp)}</div>'
+            f'<div class="kpi-sub">{r_sp/t_sp*100:.1f}% del total</div></div>'
+            f'<div class="kpi"><div class="kpi-label">LEADS</div>'
+            f'<div class="kpi-val">{fn(r_ld)}</div>'
+            f'<div class="kpi-sub">CPL {fc(r_cpl) if r_ld else "—"}</div></div>'
+            f'<div class="kpi"><div class="kpi-label">CTR</div>'
+            f'<div class="kpi-val">{fp(r_ctr)}</div>'
+            f'<div class="kpi-sub">vs {fp(p_ctr)} prospecting</div></div>'
+            f'</div>'
+        )
+
+    # ── CRM funnel steps ─────────────────────────────────────────────
+    def conv_rate_html(num, denom):
+        if not denom:
+            return ''
+        pct2 = num / denom * 100
+        cls  = 'ok' if pct2 >= 40 else ('warn' if pct2 >= 20 else 'bad')
+        return f'<div class="fstep-rate {cls}">{pct2:.1f}% del anterior</div>'
+
+    pipeline_total = contactados + interesados + evaluando + promesa + estudiantes
+
+    # ── Full HTML ────────────────────────────────────────────────────
+    return f'''<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{client_name} — Reporte Paid Media · {month_es} {today.year}</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{
+  --white:#ffffff;--off:#f7f6f3;--surface:#f0efe9;
+  --border:rgba(0,0,0,.08);--border-mid:rgba(0,0,0,.14);
+  --text:#1a1a18;--muted:#6b6b66;--hint:#9e9e98;
+  --pri:{primary};--pri-l:{primary_l};--pri-m:{primary_m};
+  --red:#c0392b;--red-l:#fdf0ee;
+  --amber:#8a5a00;--amber-l:#fdf5e0;
+  --green:#1a5c1a;--green-l:#eef7ee;--green-m:#1D9E75;
+  --radius:10px;--rl:14px;
+}}
+html{{scroll-behavior:smooth}}
+body{{font-family:'DM Sans',sans-serif;background:var(--off);color:var(--text);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}}
+.rh{{background:var(--white);border-bottom:1px solid var(--border);padding:40px 0 32px}}
+.container{{max-width:960px;margin:0 auto;padding:0 32px}}
+.hi{{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap}}
+.dot{{width:9px;height:9px;border-radius:50%;background:var(--pri-m);display:inline-block;margin-right:8px}}
+.bname{{font-size:12px;font-weight:500;color:var(--muted);letter-spacing:.04em}}
+.htitle{{font-size:26px;font-weight:600;letter-spacing:-.02em;line-height:1.2;margin-top:8px}}
+.hsub{{font-size:13px;color:var(--muted);margin-top:4px}}
+.hper{{font-family:'DM Mono',monospace;font-size:11px;color:var(--hint);background:var(--surface);padding:6px 12px;border-radius:6px}}
+.curva{{font-family:'DM Mono',monospace;font-size:11px;padding:6px 12px;border-radius:6px;font-weight:600}}
+.curva.ok{{background:var(--green-l);color:var(--green)}}
+.curva.warn{{background:var(--amber-l);color:var(--amber)}}
+.curva.bad{{background:var(--red-l);color:var(--red)}}
+.nav{{background:var(--white);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:99}}
+.ni{{display:flex;overflow-x:auto;max-width:960px;margin:0 auto;padding:0 32px}}
+.nl{{font-size:12px;font-weight:500;color:var(--muted);padding:13px 18px;text-decoration:none;white-space:nowrap;border-bottom:2px solid transparent;transition:all .15s}}
+.nl:hover,.nl.active{{color:var(--text);border-bottom-color:var(--text)}}
+.main{{max-width:960px;margin:0 auto;padding:40px 32px 80px}}
+.sec{{margin-bottom:56px}}
+.sh{{display:flex;align-items:baseline;gap:12px;margin-bottom:20px;padding-bottom:12px;border-bottom:1px solid var(--border)}}
+.sn{{font-family:'DM Mono',monospace;font-size:11px;color:var(--hint)}}
+.st{{font-size:18px;font-weight:600;letter-spacing:-.01em}}
+.sb{{font-size:10px;font-weight:500;padding:2px 8px;border-radius:20px;background:var(--pri-l);color:var(--pri)}}
+.kg{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:16px}}
+.kg3{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:16px}}
+.kpi{{background:var(--white);border:1px solid var(--border);border-radius:var(--radius);padding:16px}}
+.kl{{font-size:11px;color:var(--hint);margin-bottom:4px;font-weight:500;letter-spacing:.02em}}
+.kv{{font-size:24px;font-weight:600;line-height:1.1;margin-bottom:4px;letter-spacing:-.02em}}
+.ks{{font-size:11px;color:var(--muted)}}
+.ks b{{font-weight:600}}
+.kpi.ok{{border-top:2px solid var(--green-m)}}
+.kpi.warn{{border-top:2px solid #e6a800}}
+.kpi.bad{{border-top:2px solid var(--red)}}
+.kpi.pri{{border-top:2px solid var(--pri-m)}}
+.al{{border-radius:0 var(--radius) var(--radius) 0;padding:12px 16px;font-size:13px;line-height:1.6;margin-bottom:16px}}
+.al b{{font-weight:600}}
+.al-blue{{background:var(--pri-l);color:var(--pri);border-left:3px solid var(--pri-m)}}
+.al-amber{{background:var(--amber-l);color:var(--amber);border-left:3px solid #e6a800}}
+.al-green{{background:var(--green-l);color:var(--green);border-left:3px solid var(--green-m)}}
+.tw{{background:var(--white);border:1px solid var(--border);border-radius:var(--rl);overflow:hidden;margin-bottom:14px}}
+.tbl{{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}}
+.tbl th{{background:var(--surface);font-size:10px;font-weight:600;color:var(--hint);letter-spacing:.05em;padding:10px 12px;text-align:left;border-bottom:1px solid var(--border-mid)}}
+.tbl th:not(:first-child){{text-align:right}}
+.tbl td{{padding:9px 12px;border-bottom:1px solid var(--border);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.tbl td:not(:first-child){{text-align:right;font-family:'DM Mono',monospace;font-size:11px}}
+.tbl tr:last-child td{{border-bottom:none}}
+.tbl tr:hover td{{background:var(--off)}}
+.camp-row td{{background:var(--surface)!important;font-weight:700}}
+.adset-row td{{background:var(--white)}}
+.total-row td{{background:var(--pri-l)!important;font-weight:700;border-top:2px solid var(--pri-m)!important}}
+.fw{{background:var(--white);border:1px solid var(--border);border-radius:var(--rl);padding:24px;margin-bottom:14px}}
+.frow{{display:flex;gap:8px;align-items:stretch;margin-bottom:12px;flex-wrap:wrap}}
+.fstep{{background:var(--off);border-radius:8px;padding:12px 16px;flex:1;min-width:90px}}
+.fstep.hi2{{background:var(--pri-l);border:1px solid var(--pri-m)}}
+.fstep.win{{background:var(--green-l);border:1px solid var(--green-m)}}
+.fstep-name{{font-size:10px;color:var(--hint);font-weight:600;letter-spacing:.04em;margin-bottom:4px}}
+.fstep-val{{font-size:20px;font-weight:600;line-height:1.1;margin-bottom:2px}}
+.fstep-rate{{font-size:10px;color:var(--muted)}}
+.fstep-rate.ok{{color:var(--green)}}
+.fstep-rate.warn{{color:var(--amber)}}
+.fstep-rate.bad{{color:var(--red)}}
+.arr{{color:var(--hint);font-size:18px;align-self:center;flex-shrink:0}}
+.mq{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}}
+.mb{{background:var(--pri-l);border:1px solid var(--pri-m);border-radius:var(--radius);padding:16px}}
+.mb.g{{background:var(--green-l);border-color:var(--green-m)}}
+.ml{{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--pri);margin-bottom:4px}}
+.mb.g .ml{{color:var(--green)}}
+.mv{{font-size:28px;font-weight:600;letter-spacing:-.02em}}
+.ms{{font-size:11px;color:var(--muted);margin-top:4px}}
+.ob{{background:var(--white);border:1px solid var(--border);border-radius:var(--rl);padding:20px 22px;margin-bottom:16px}}
+.oh{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px}}
+.ol{{font-size:13px;font-weight:600}}
+.on{{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted)}}
+.pb{{height:8px;background:var(--surface);border-radius:4px;overflow:hidden;margin:8px 0 4px}}
+.pf{{height:100%;border-radius:4px}}
+.pf.ok{{background:var(--green-m)}}
+.pf.warn{{background:#e6a800}}
+.pf.bad{{background:var(--red)}}
+.ab{{background:var(--white);border:1px solid var(--border);border-radius:var(--rl);padding:20px 22px;margin-bottom:12px}}
+.ah{{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px}}
+.at{{font-size:13px;font-weight:500;line-height:1.5;flex:1}}
+.pr{{font-size:9px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:20px;white-space:nowrap;margin-top:2px;flex-shrink:0}}
+.p-alta{{background:var(--red-l);color:var(--red)}}
+.p-media{{background:var(--amber-l);color:var(--amber)}}
+.p-baja{{background:var(--green-l);color:var(--green)}}
+.ac{{font-size:10px;color:var(--hint);font-weight:500}}
+.pill{{font-size:9px;font-weight:700;padding:1px 6px;border-radius:20px;letter-spacing:.02em}}
+.pill-ok{{background:var(--green-l);color:var(--green)}}
+.pill-bad{{background:var(--red-l);color:var(--red)}}
+.pill-new{{background:var(--amber-l);color:var(--amber)}}
+.ok{{color:var(--green)}}
+.warn{{color:var(--amber)}}
+.bad{{color:var(--red)}}
+footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 0;margin-top:32px}}
+.fn{{font-size:11px;color:var(--hint);line-height:1.8}}
+@media(max-width:640px){{
+  .kg{{grid-template-columns:1fr 1fr}}
+  .kg3{{grid-template-columns:1fr 1fr}}
+  .frow{{flex-direction:column}}
+  .arr{{transform:rotate(90deg)}}
+  .mq{{grid-template-columns:1fr}}
+  .container{{padding:0 16px}}
+  .main{{padding:24px 16px 60px}}
+  .ni{{padding:0 16px}}
+}}
+@media print{{.nav{{display:none}}body{{background:white}}.sec{{page-break-inside:avoid}}}}
+</style>
+</head>
+<body>
+
+<header class="rh">
+<div class="container">
+<div class="hi">
+  <div>
+    <div class="bname"><span class="dot"></span>{client_name} &middot; Paid Media</div>
+    <div class="htitle">Reporte Mensual de Performance</div>
+    <div class="hsub">Meta Ads + CRM &middot; {period_str}</div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <div class="hper">{period_str}</div>
+    <div class="curva {curva_cls}">Curva {fp(curva_pct)} &middot; D\xeda {elapsed_d}/{total_d}</div>
+  </div>
+</div>
+</div>
+</header>
+
+<nav class="nav">
+<div class="ni">
+  <a class="nl active" href="#resumen">Resumen</a>
+  <a class="nl" href="#meta">Meta Ads</a>
+  <a class="nl" href="#crm">CRM</a>
+  <a class="nl" href="#programas">Programas</a>
+  <a class="nl" href="#remarketing">Remarketing</a>
+  <a class="nl" href="#accionables">Accionables</a>
+</div>
+</nav>
+
+<main class="main">
+
+<!-- 01 RESUMEN -->
+<section class="sec" id="resumen">
+<div class="sh"><span class="sn">01</span><h2 class="st">Resumen ejecutivo</h2><span class="sb">{month_es} {today.year}</span></div>
+
+<div class="kg">
+  <div class="kpi pri">
+    <div class="kl">INVERSI\xd3N TOTAL</div>
+    <div class="kv">{fc(t_sp)}</div>
+    <div class="ks">Prosp. {fc(p_sp)} &middot; Remark. {fc(r_sp) if r_sp else "—"}</div>
+  </div>
+  <div class="kpi {_kc(leads_pct, curva_pct)}">
+    <div class="kl">LEADS META ADS</div>
+    <div class="kv">{fn(t_ld)}</div>
+    <div class="ks">Obj. {fn(obj["leads"])} &middot; <b>{fp(leads_pct)}</b> {pace_badge(leads_pace)}</div>
+  </div>
+  <div class="kpi">
+    <div class="kl">CPL GENERAL</div>
+    <div class="kv">{fc(t_cpl)}</div>
+    <div class="ks">Prosp. {fc(p_cpl)} &middot; Remark. {fc(r_cpl) if r_ld else "—"}</div>
+  </div>
+  <div class="kpi">
+    <div class="kl">CTR &middot; CPM</div>
+    <div class="kv">{fp(t_ctr)}</div>
+    <div class="ks">CPM {fc(t_cpm)} &middot; {fn(t_imp)} impr.</div>
+  </div>
+</div>
+
+<div class="kg">
+  <div class="kpi">
+    <div class="kl">MQL (PIPELINE TOTAL)</div>
+    <div class="kv">{fn(mql)}</div>
+    <div class="ks">{fp(mql_rate)} de leads Meta → CRM</div>
+  </div>
+  <div class="kpi">
+    <div class="kl">SQL (PIPELINE ACTIVO)</div>
+    <div class="kv">{fn(sql)}</div>
+    <div class="ks">{fp(sql_rate)} de leads &middot; sin inscriptos/perdidos</div>
+  </div>
+  <div class="kpi {_kc(ventas_pct, curva_pct)}">
+    <div class="kl">VENTAS / INSCRIPTOS</div>
+    <div class="kv">{fn(ventas)}</div>
+    <div class="ks">Obj. {fn(obj["ventas"])} &middot; <b>{fp(ventas_pct)}</b> {pace_badge(ventas_pace)}</div>
+  </div>
+  <div class="kpi">
+    <div class="kl">CAC (COSTO POR VENTA)</div>
+    <div class="kv">{fc(t_sp / ventas) if ventas else "—"}</div>
+    <div class="ks">Inversi\xf3n total / inscriptos</div>
+  </div>
+</div>
+
+<div class="ob">
+  <div style="margin-bottom:20px">
+    <div class="oh">
+      <div class="ol">\U0001f4ca Leads vs objetivo del mes</div>
+      <div class="on">{fn(t_ld)} de {fn(obj["leads"])} &middot; Curva {fp(curva_pct)}</div>
+    </div>
+    <div class="pb"><div class="pf {_kc(leads_pct, curva_pct)}" style="width:{min(leads_pct,100):.1f}%"></div></div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;font-family:DM Mono,monospace;color:var(--hint)">
+      <span>0</span>
+      <span style="color:var(--pri)">Curva esperada: {fn(int(obj["leads"] * curva_pct / 100))}</span>
+      <span>{fn(obj["leads"])}</span>
+    </div>
+  </div>
+  <div>
+    <div class="oh">
+      <div class="ol">\U0001f3c6 Ventas / inscriptos vs objetivo</div>
+      <div class="on">{fn(ventas)} de {fn(obj["ventas"])} &middot; Curva {fp(curva_pct)}</div>
+    </div>
+    <div class="pb"><div class="pf {_kc(ventas_pct, curva_pct)}" style="width:{min(ventas_pct,100):.1f}%"></div></div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;font-family:DM Mono,monospace;color:var(--hint)">
+      <span>0</span>
+      <span style="color:var(--pri)">Curva esperada: {int(obj["ventas"] * curva_pct / 100)}</span>
+      <span>{fn(obj["ventas"])}</span>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- 02 META ADS -->
+<section class="sec" id="meta">
+<div class="sh"><span class="sn">02</span><h2 class="st">Meta Ads — Prospecting</h2><span class="sb">Nivel adset</span></div>
+{'<div class="al al-amber">Sin datos de Meta Ads para el per\xedodo seleccionado.</div>' if not meta_data else ''}
+<div class="tw">
+<table class="tbl">
+<colgroup>
+  <col style="width:40%"><col style="width:12%"><col style="width:10%">
+  <col style="width:10%"><col style="width:10%"><col style="width:12%">
+</colgroup>
+<thead>
+<tr>
+  <th>Campa\xf1a / Conjunto de anuncios</th>
+  <th>Inversi\xf3n</th><th>Leads</th><th>CPL</th><th>CTR</th><th>Impresiones</th>
+</tr>
+</thead>
+<tbody>
+<tr class="total-row">
+  <td>TOTAL PROSPECTING</td>
+  <td>{fc(p_sp)}</td><td>{fn(p_ld) if p_ld else "—"}</td>
+  <td>{fc(p_cpl) if p_ld else "—"}</td>
+  <td>{fp(p_ctr)}</td><td>{fn(t_imp)}</td>
+</tr>
+{camps_html}
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- 03 CRM -->
+<section class="sec" id="crm">
+<div class="sh"><span class="sn">03</span><h2 class="st">Funnel CRM</h2><span class="sb">Zoho &middot; Deals</span></div>
+{'<div class="al al-amber">Sin datos de CRM disponibles.</div>' if not crm_data else ''}
+
+<div class="fw">
+<div class="frow">
+  <div class="fstep">
+    <div class="fstep-name">CONTACTADOS</div>
+    <div class="fstep-val">{fn(contactados)}</div>
+    <div class="fstep-rate">Entrada al pipeline</div>
+  </div>
+  <div class="arr">&rarr;</div>
+  <div class="fstep">
+    <div class="fstep-name">INTERESADOS</div>
+    <div class="fstep-val">{fn(interesados)}</div>
+    {conv_rate_html(interesados, contactados)}
+  </div>
+  <div class="arr">&rarr;</div>
+  <div class="fstep">
+    <div class="fstep-name">EVALUANDO</div>
+    <div class="fstep-val">{fn(evaluando)}</div>
+    {conv_rate_html(evaluando, interesados)}
+  </div>
+  <div class="arr">&rarr;</div>
+  <div class="fstep hi2">
+    <div class="fstep-name">PROMESA DE PAGO</div>
+    <div class="fstep-val">{fn(promesa)}</div>
+    {conv_rate_html(promesa, evaluando)}
+  </div>
+  <div class="arr">&rarr;</div>
+  <div class="fstep win">
+    <div class="fstep-name" style="color:var(--green)">INSCRIPTO</div>
+    <div class="fstep-val">{fn(estudiantes)}</div>
+    {f'<div class="fstep-rate ok">{estudiantes/pipeline_total*100:.1f}% del total</div>' if pipeline_total else ''}
+  </div>
+</div>
+
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
+  <div style="background:var(--red-l);border-radius:8px;padding:10px 16px;font-size:12px;color:var(--red)">
+    <b>❌ Perdidos:</b> {fn(perdidos)}{f" ({perdidos/mql*100:.1f}% del MQL)" if mql else ""}
+  </div>
+  {f'<div style="background:var(--off);border-radius:8px;padding:10px 16px;font-size:12px;color:var(--muted)"><b>Leads sin contactar:</b> {crm_data.get("leads_total",0):,}</div>' if crm_data else ""}
+</div>
+
+<div class="mq">
+  <div class="mb">
+    <div class="ml">MQL — Marketing Qualified</div>
+    <div class="mv">{fn(mql)}</div>
+    <div class="ms">Todos los que pasaron a oportunidad &middot; {fp(mql_rate)} de leads Meta</div>
+  </div>
+  <div class="mb g">
+    <div class="ml">SQL — Pipeline Activo</div>
+    <div class="mv">{fn(sql)}</div>
+    <div class="ms">Sin inscriptos ni perdidos &middot; {fp(sql_rate)} de leads Meta</div>
+  </div>
+</div>
+</div>
+{fuentes_html}
+</section>
+
+<!-- 04 PROGRAMAS -->
+<section class="sec" id="programas">
+<div class="sh"><span class="sn">04</span><h2 class="st">Inversi\xf3n por programa</h2><span class="sb">Meta ↔ CRM</span></div>
+<div class="al al-blue"><b>Matching autom\xe1tico:</b> ✓ = match confirmado &middot; ~ = aproximado (puede diferir en nomenclatura). Verific\xe1 y ajust\xe1 si es necesario.</div>
+<div class="tw">
+<table class="tbl">
+<colgroup>
+  <col style="width:38%"><col style="width:12%">
+  <col style="width:14%"><col style="width:12%"><col style="width:14%">
+</colgroup>
+<thead>
+<tr>
+  <th>Programa</th>
+  <th>Leads Meta</th><th>Inversi\xf3n</th><th>CPL</th><th>Pipeline CRM</th>
+</tr>
+</thead>
+<tbody>{progs_html}</tbody>
+</table>
+</div>
+</section>
+
+<!-- 05 REMARKETING -->
+<section class="sec" id="remarketing">
+<div class="sh"><span class="sn">05</span><h2 class="st">Remarketing</h2><span class="sb">Campa\xf1as de retargeting</span></div>
+{remark_kpis}
+<div class="tw">
+<table class="tbl">
+<thead>
+<tr><th style="width:50%">Campa\xf1a</th><th>Inversi\xf3n</th><th>Leads</th><th>CPL</th></tr>
+</thead>
+<tbody>{remark_html}</tbody>
+</table>
+</div>
+</section>
+
+<!-- 06 ACCIONABLES -->
+<section class="sec" id="accionables">
+<div class="sh"><span class="sn">06</span><h2 class="st">Accionables</h2><span class="sb">Auto-generado</span></div>
+{acc_html}
+</section>
+
+</main>
+
+<footer>
+<div class="container">
+<div class="fn">
+  Reporte generado el {today.strftime("%d/%m/%Y")} &middot; {period_str} &middot; {client_name}<br>
+  Datos: Meta Ads Graph API v21.0 + Zoho CRM &middot; Procesado por Marketing Agent Bot
+</div>
+</div>
+</footer>
+
+<script>
+const secs=document.querySelectorAll('section[id]');
+const nls=document.querySelectorAll('.nl');
+new IntersectionObserver(entries=>{{
+  entries.forEach(e=>{{
+    if(e.isIntersecting){{
+      nls.forEach(l=>l.classList.remove('active'));
+      const a=document.querySelector('.nl[href="#'+e.target.id+'"]');
+      if(a)a.classList.add('active');
+    }}
+  }});
+}},{{threshold:0.25}}).observe&&secs.forEach(s=>new IntersectionObserver(entries=>{{
+  entries.forEach(e=>{{if(e.isIntersecting){{nls.forEach(l=>l.classList.remove('active'));const a=document.querySelector('.nl[href="#'+e.target.id+'"]');if(a)a.classList.add('active');}}}}
+  }},{{threshold:0.25}}).observe(s));
+</script>
+</body>
+</html>'''
+
+
+def h_paid_report(text, state):
+    """Genera link del reporte HTML paid media."""
+    t = text.lower()
+    is_ebds = 'ebds' in t
+    slug    = 'ebds' if is_ebds else 'bhu'
+    key     = os.environ.get('CALENDAR_KEY', 'sofia2026mkt')
+    client_name = 'EBDS' if is_ebds else 'BHU/UIN'
+    url = f'https://vercel-deploy-tan-one.vercel.app/report/paid-media?key={key}&client={slug}'
+    tg_send(
+        f'\U0001f4ca *Reporte Paid Media — {client_name}*\n\n'
+        f'\U0001f517 {url}\n\n'
+        f'_Abr\xed el link, guard\xe1 como HTML (Ctrl+S) y compart\xed._'
+    )
+    return state
+
+
+@app.route('/report/paid-media')
+def paid_media_report_route():
+    key      = request.args.get('key', '')
+    expected = os.environ.get('CALENDAR_KEY', 'sofia2026mkt')
+    if key != expected:
+        return Response('<h2>Acceso no autorizado</h2>', status=401, mimetype='text/html')
+
+    client_param = request.args.get('client', 'bhu').lower()
+    is_ebds      = (client_param == 'ebds')
+    client_name  = 'EBDS' if is_ebds else 'BHU/UIN'
+    month_date   = dt.date.today()
+
+    meta_data = []
+    try:
+        meta_data = fetch_meta_monthly(is_ebds=is_ebds, month_date=month_date)
+    except Exception as e:
+        print(f'paid_media_route meta error: {e}')
+
+    crm_data = None
+    try:
+        if is_ebds and ZOHO_EBDS_REFRESH_TOKEN:
+            crm_data = zoho_crm_funnel_ebds()
+        elif not is_ebds and ZOHO_REFRESH_TOKEN:
+            crm_data = zoho_crm_funnel()
+    except Exception as e:
+        print(f'paid_media_route crm error: {e}')
+
+    html = build_paid_media_html(client_name, meta_data, crm_data, month_date)
+    return Response(html, mimetype='text/html')
