@@ -434,7 +434,8 @@ STATE_DEFAULTS = {
 }
 
 # Tarea dedicada SOLO para el calendario — nunca se toca desde crons/webhook
-CALENDAR_TASK_ID = '86ahv938h'
+CALENDAR_TASK_ID        = '86ahv938h'
+CALENDAR_BACKUP_TASK_ID = '86ahva45t'  # backup automático antes de cada escritura
 
 def _decode_task_desc(desc):
     """Decodifica base64 o JSON plano desde el campo description de una tarea ClickUp."""
@@ -482,7 +483,17 @@ def read_calendar():
         return {}
 
 def save_calendar(calendar_data):
-    """Guarda el calendario en su tarea dedicada. Nunca toca el estado del bot."""
+    """Guarda el calendario en su tarea dedicada. Nunca toca el estado del bot.
+    Antes de escribir, copia el estado actual al backup (para recuperación manual)."""
+    try:
+        # Rotar backup: leer el estado actual y copiarlo al backup ANTES de sobrescribir
+        task = cu_get(f'task/{CALENDAR_TASK_ID}')
+        current_desc = task.get('description', '') or ''
+        if current_desc.strip():
+            cu_put(f'task/{CALENDAR_BACKUP_TASK_ID}', {'markdown_description': current_desc})
+    except Exception as e:
+        print(f'Calendar backup error (non-fatal): {e}')
+    # Escribir el nuevo estado en la tarea principal
     cu_put(f'task/{CALENDAR_TASK_ID}', {'markdown_description': _encode_for_clickup(calendar_data)})
 
 # --- Helpers ---
@@ -3733,6 +3744,27 @@ def calendar_delete_route():
     all_data[month_str] = month_data
     save_calendar(all_data)
     return Response('OK', status=200)
+
+@app.route('/calendar/restore-backup', methods=['POST'])
+def calendar_restore_backup_route():
+    """Restaura el calendario desde el backup. Usar solo si el calendario principal se corrompió."""
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    try:
+        task = cu_get(f'task/{CALENDAR_BACKUP_TASK_ID}')
+        backup_desc = task.get('description', '') or ''
+        if not backup_desc.strip():
+            return Response(json.dumps({'error': 'Backup vacío — nada para restaurar'}),
+                            status=404, mimetype='application/json')
+        # Restaurar: copiar backup → principal (sin pasar por save_calendar para no pisar el backup)
+        cu_put(f'task/{CALENDAR_TASK_ID}', {'markdown_description': backup_desc})
+        restored = _decode_task_desc(backup_desc)
+        total = sum(len(v) for month in restored.values() for v in (month.values() if isinstance(month, dict) else []))
+        return Response(json.dumps({'ok': True, 'restored_posts': total}),
+                        status=200, mimetype='application/json')
+    except Exception as e:
+        return Response(json.dumps({'error': str(e)}), status=500, mimetype='application/json')
 
 @app.route('/calendar/regenerate-post', methods=['POST'])
 def calendar_regenerate_post_route():
