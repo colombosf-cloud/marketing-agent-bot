@@ -141,63 +141,172 @@ def zoho_get(path, params=None, client='bhu'):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read())
 
-def zoho_crm_funnel():
+def _zoho_get_all(module, params, client='bhu', max_pages=10):
+    """Pagina automáticamente hasta obtener todos los registros de un módulo Zoho."""
+    all_data = []
+    for page in range(1, max_pages + 1):
+        params['page'] = page
+        params['per_page'] = 200
+        resp = zoho_get(module, params, client=client)
+        batch = resp.get('data', [])
+        all_data.extend(batch)
+        info = resp.get('info', {})
+        if not info.get('more_records', False) or len(batch) < 200:
+            break
+    return all_data
+
+def zoho_crm_funnel(month_date=None):
     """
-    Funnel completo BHU/UIN:
-      - Leads module  → sin contactar
-      - Deals module  → stages del pipeline
+    Funnel completo BHU/UIN — con paginación completa.
     Stages: 1.Contactado / 2.Interesado / 3.Evaluando / 4.Promesa de Pago /
-            8.Validado para facturar comisión / 5-7 Estudiante/Inscripto / 99.Perdido
+            6.Inscrito(a) / 8.Validado para facturar comisión / 99.Perdido
+    mql_mes:    deals creados en el mes (Created_Time).
+    ventas_mes: deals con Fecha_Matriculado en el mes, institución Universidad Insurgentes.
+    leads_por_fuente: filtrado por Created_Time del mes (no histórico).
     """
-    from collections import Counter
+    from collections import Counter, defaultdict
+    if month_date is None:
+        month_date = dt.date.today()
     try:
-        # --- Leads (no contactados aún) ---
-        leads_data = zoho_get('Leads', {
-            'per_page': 200,
-            'fields': 'Lead_Status,Lead_Source,Created_Time,Programa_UIN'
-        }).get('data', [])
+        month_start = month_date.replace(day=1).isoformat()[:10]
+        month_end   = month_date.isoformat()[:10]
+
+        # --- Leads (no contactados aún) — paginado ---
+        leads_data = _zoho_get_all('Leads', {
+            'fields': 'Lead_Status,Lead_Source,Created_Time,Programa_UIN,Owner'
+        })
 
         leads_por_estado = Counter(l.get('Lead_Status') or 'Sin gestión' for l in leads_data)
-        leads_por_fuente = Counter(l.get('Lead_Source') or 'Sin fuente'  for l in leads_data)
+        # leads_por_fuente filtrado por el mes (no histórico) — se completa con Deals más abajo
+        leads_mes_fuente = [l for l in leads_data
+                            if month_start <= (l.get('Created_Time') or '')[:10] <= month_end]
+        leads_por_fuente = Counter(l.get('Lead_Source') or 'Sin fuente' for l in leads_mes_fuente)
 
-        # --- Deals (pipeline de oportunidades) ---
-        deals_data = zoho_get('Deals', {
-            'per_page': 200,
-            'fields': 'Stage,Programa_UIN,Lead_Source,Unidad_de_Negocio,Created_Time'
-        }).get('data', [])
+        # --- Deals (pipeline) — paginado ---
+        deals_data = _zoho_get_all('Deals', {
+            'fields': 'Stage,Programa_UIN,Lead_Source,Unidad_de_Negocio,Instituci_n,Created_Time,Modified_Time,Fecha_Matriculado,Owner'
+        })
 
         # Clasificar stages
-        ESTUDIANTE_STAGES = {'8. validado para facturar comisión', '5. estudiante', '6. inscripto',
-                             '7. validado para comision', 'estudiante', 'inscripto', 'validado'}
-        PERDIDO_STAGES    = {'99. perdido', 'perdido', '99.perdido'}
+        ESTUDIANTE_STAGES = {
+            '8. validado para facturar comisión', '8. validado para facturar comision',
+            '6. inscripto', '6. inscrito',
+            '5. estudiante', '7. validado para comision',
+            'estudiante', 'inscripto', 'inscrito', 'validado para facturar',
+        }
+        PERDIDO_STAGES = {'99. perdido', 'perdido', '99.perdido'}
 
         stages = Counter(d.get('Stage') or 'Sin etapa' for d in deals_data)
-        programas = Counter(d.get('Programa_UIN') or 'Sin programa' for d in deals_data if d.get('Stage','').lower() not in PERDIDO_STAGES)
+        programas = Counter(d.get('Programa_UIN') or 'Sin programa' for d in deals_data
+                            if d.get('Stage', '').lower() not in PERDIDO_STAGES)
 
-        # Agrupar en funnel
+        # Agrupar en funnel (all-time, para la vista de pipeline)
         funnel = {
             'leads_sin_contactar': sum(leads_por_estado.values()),
-            'contactados':    0, 'interesados': 0, 'evaluando': 0,
-            'promesa_pago':   0, 'estudiantes': 0, 'perdidos':  0,
+            'contactados': 0, 'interesados': 0, 'evaluando': 0,
+            'promesa_pago': 0, 'estudiantes': 0, 'perdidos': 0,
         }
         for stage, count in stages.items():
             sl = stage.lower()
-            if '1.' in sl or 'contactado' in sl:  funnel['contactados']   += count
+            if '1.' in sl or ('contactado' in sl and '5.' not in sl): funnel['contactados']   += count
             elif '2.' in sl or 'interesado' in sl: funnel['interesados']  += count
             elif '3.' in sl or 'evaluando'  in sl: funnel['evaluando']    += count
             elif '4.' in sl or 'promesa'    in sl: funnel['promesa_pago'] += count
             elif any(s in sl for s in ESTUDIANTE_STAGES): funnel['estudiantes'] += count
             elif any(s in sl for s in PERDIDO_STAGES):    funnel['perdidos']    += count
 
+        # --- MQL del mes: deals creados en el mes ---
+        deals_mes = [d for d in deals_data
+                     if month_start <= (d.get('Created_Time') or '')[:10] <= month_end]
+        mql_mes = len(deals_mes)
+        # Sumar Deals del mes a leads_por_fuente (leads convertidos ya no están en módulo Leads)
+        leads_por_fuente += Counter(d.get('Lead_Source') or 'Sin fuente' for d in deals_mes)
+
+        # --- Ventas del mes: deals con Fecha_Matriculado en el mes (Universidad Insurgentes) ---
+        ventas_mes = sum(
+            1 for d in deals_data
+            if (d.get('Fecha_Matriculado') or '')[:10] != ''
+            and month_start <= (d.get('Fecha_Matriculado') or '')[:10] <= month_end
+            and (d.get('Instituci_n') or '').lower() in ('universidad insurgentes', '')
+        )
+
+        # --- Leads del mes (para asesor breakdown) ---
+        leads_mes = [l for l in leads_data
+                     if month_start <= (l.get('Created_Time') or '')[:10] <= month_end]
+
+        def _owner_name(obj):
+            o = obj.get('Owner') or {}
+            if isinstance(o, dict):
+                return o.get('name') or o.get('Name') or 'Sin asignar'
+            return str(o) or 'Sin asignar'
+
+        # Asesor: leads del mes por estado
+        asesor_leads = defaultdict(lambda: {'leads': 0, 'estados': Counter()})
+        for l in leads_mes:
+            nm = _owner_name(l)
+            asesor_leads[nm]['leads'] += 1
+            asesor_leads[nm]['estados'][l.get('Lead_Status') or 'Sin gestión'] += 1
+
+        # Asesor: deals del mes (opps creadas en el mes)
+        asesor_opps = defaultdict(int)
+        for d in deals_mes:
+            asesor_opps[_owner_name(d)] += 1
+
+        # Asesor: ventas del mes (Fecha_Matriculado en el mes, Universidad Insurgentes)
+        asesor_ventas = defaultdict(int)
+        for d in deals_data:
+            fm = (d.get('Fecha_Matriculado') or '')[:10]
+            if fm and month_start <= fm <= month_end:
+                asesor_ventas[_owner_name(d)] += 1
+
+        all_names = set(list(asesor_leads.keys()) + list(asesor_opps.keys()) + list(asesor_ventas.keys()))
+        # Agrupar estados de leads en categorías
+        def _cat_estado(estado):
+            e = (estado or '').lower()
+            if 'sin gestión' in e or 'sin gestion' in e: return 'sin_gestion'
+            if 'intento' in e: return 'intentos'
+            if 'duplicado' in e or 'ya existe' in e: return 'duplicado'
+            if 'inválido' in e or 'invalido' in e or 'errón' in e: return 'invalido'
+            if 'no contactable' in e: return 'no_contactable'
+            if 'múltiple' in e or 'multiple' in e: return 'multiple_interes'
+            return 'otros'
+
+        asesores = []
+        for nm in sorted(all_names):
+            li = asesor_leads.get(nm, {'leads': 0, 'estados': Counter()})
+            total_leads = li['leads']
+            opps = asesor_opps.get(nm, 0)
+            ventas = asesor_ventas.get(nm, 0)
+            cats = defaultdict(int)
+            for estado, cnt in li['estados'].items():
+                cats[_cat_estado(estado)] += cnt
+            asesores.append({
+                'nombre': nm,
+                'leads': total_leads,
+                'opps': opps,
+                'ventas': ventas,
+                'conv_pct': round(ventas / total_leads * 100, 1) if total_leads else 0,
+                'sin_gestion': cats['sin_gestion'],
+                'intentos': cats['intentos'],
+                'duplicado': cats['duplicado'],
+                'invalido': cats['invalido'],
+                'no_contactable': cats['no_contactable'],
+                'multiple_interes': cats['multiple_interes'],
+            })
+        asesores.sort(key=lambda x: -(x['leads'] + x['opps']))
+
         total_deals = len(deals_data)
         return {
-            'leads_total':        funnel['leads_sin_contactar'],
-            'leads_por_estado':   dict(leads_por_estado.most_common()),
-            'leads_por_fuente':   dict(leads_por_fuente.most_common(6)),
-            'deals_total':        total_deals,
-            'funnel':             funnel,
-            'stages_raw':         dict(stages.most_common()),
-            'top_programas':      dict(programas.most_common(6)),
+            'leads_total':      sum(leads_por_estado.values()),
+            'leads_por_estado': dict(leads_por_estado.most_common()),
+            'leads_por_fuente': dict(leads_por_fuente.most_common(6)),
+            'deals_total':      total_deals,
+            'stages_raw':       dict(stages.most_common()),
+            'funnel':           funnel,
+            'mql_mes':          mql_mes,
+            'ventas_mes':       ventas_mes,
+            'top_programas':    dict(programas.most_common(6)),
+            'asesores':         asesores,
         }
     except Exception as e:
         print(f'Zoho funnel error: {e}')
@@ -321,37 +430,60 @@ STATE_DEFAULTS = {
     'notified_validar_tasks': [],
     'active_conversation': None,
     'pending_approvals': [],
-    'calendar': {},
     'last_post_ids': {},
 }
 
+# Tarea dedicada SOLO para el calendario — nunca se toca desde crons/webhook
+CALENDAR_TASK_ID = '86ahv938h'
+
+def _decode_task_desc(desc):
+    """Decodifica base64 o JSON plano desde el campo description de una tarea ClickUp."""
+    if not desc or not desc.strip():
+        return {}
+    try:
+        return json.loads(base64.b64decode(desc.strip().encode()).decode('utf-8'))
+    except Exception:
+        try:
+            return json.loads(desc)
+        except Exception:
+            return {}
+
+def _encode_for_clickup(data):
+    """Serializa dict a base64 para guardar en ClickUp."""
+    return base64.b64encode(json.dumps(data, ensure_ascii=False).encode('utf-8')).decode('ascii')
+
 def read_state():
-    """Lee el estado del bot desde ClickUp. Siempre garantiza que todas las claves estándar estén presentes."""
+    """Lee SOLO el estado del bot (last_offset, validar, etc.).
+    El calendario está en CALENDAR_TASK_ID — nunca se mezcla aquí."""
     loaded = {}
     try:
         task = cu_get(f'task/{STATE_TASK_ID}')
-        desc = task.get('description', '') or ''
-        if desc:
-            try:
-                decoded = base64.b64decode(desc.strip().encode()).decode('utf-8')
-                loaded = json.loads(decoded)
-            except Exception:
-                try:
-                    loaded = json.loads(desc)
-                except Exception:
-                    pass
+        loaded = _decode_task_desc(task.get('description', '') or '')
     except Exception:
         pass
-    # Merge defaults — ensures all keys exist even if state was saved partially
     state = dict(STATE_DEFAULTS)
-    state.update(loaded)
+    # Nunca importar 'calendar' en el estado del bot
+    state.update({k: v for k, v in loaded.items() if k != 'calendar'})
     return state
 
 def save_state(state):
-    """Guarda estado en ClickUp codificado en base64 para evitar que ClickUp altere los caracteres."""
+    """Guarda SOLO el estado del bot en ClickUp. Nunca incluye el calendario."""
+    state.pop('calendar', None)          # garantía extra: nunca entra el calendario
     state['last_run'] = datetime.utcnow().isoformat() + 'Z'
-    encoded = base64.b64encode(json.dumps(state, ensure_ascii=False).encode('utf-8')).decode('ascii')
-    cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': encoded})
+    cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': _encode_for_clickup(state)})
+
+def read_calendar():
+    """Lee el calendario desde su tarea dedicada (CALENDAR_TASK_ID).
+    Completamente independiente del estado del bot."""
+    try:
+        task = cu_get(f'task/{CALENDAR_TASK_ID}')
+        return _decode_task_desc(task.get('description', '') or '')
+    except Exception:
+        return {}
+
+def save_calendar(calendar_data):
+    """Guarda el calendario en su tarea dedicada. Nunca toca el estado del bot."""
+    cu_put(f'task/{CALENDAR_TASK_ID}', {'markdown_description': _encode_for_clickup(calendar_data)})
 
 # --- Helpers ---
 def detect_client(text):
@@ -474,7 +606,7 @@ TOP PROGRAMAS (en pipeline activo):
 FUENTES DE LEADS:
 {json.dumps(funnel['leads_por_fuente'], ensure_ascii=False)}
 
-{('META ADS — conjuntos activos últimos 30d (nivel adset):\n' + json.dumps([{"adset": c.get("adset_name",""), "campaign": c.get("campaign_name",""), "spend": c.get("spend",0), "leads": sum(int(a.get("value",0)) for a in (c.get("actions") or []) if a.get("action_type") in ("lead","onsite_conversion.lead_grouped")), "ctr": c.get("ctr",0)} for c in meta_data[:15]], ensure_ascii=False)) if meta_data else 'Meta Ads: sin datos'}
+{('META ADS — conjuntos activos últimos 30d (nivel adset):\n' + json.dumps([{"adset": c.get("adset_name",""), "campaign": c.get("campaign_name",""), "spend": c.get("spend",0), "leads": sum(int(a.get("value",0)) for a in (c.get("actions") or []) if a.get("action_type") == "onsite_conversion.lead_grouped"), "ctr": c.get("ctr",0)} for c in meta_data[:15]], ensure_ascii=False)) if meta_data else 'Meta Ads: sin datos'}
 
 Formato para Telegram con Markdown:
 📊 *{client_name} — CRM + Meta Ads*
@@ -1260,8 +1392,24 @@ SOCIAL_ACCOUNTS = [
 CALENDAR_BRANDS = ['EBDS', 'Sibila', 'ZoWeAre', 'Tivenos', 'BHU']
 
 BRAND_CONTEXT = {
-    'EBDS': """European Business & Digital School. Posgrados y masters online con titulación propia y europea. Audiencia: profesionales 25-45 que quieren escalar en tecnología, gestión, diseño y negocios digitales. Tono: aspiracional, educativo, profesional. Pilares: programas académicos (MBA Digital, Data Analytics, UX/UI, Marketing Digital, Gestión de Proyectos, Inteligencia Artificial), empleabilidad, casos de éxito de alumnos, innovación digital, tips profesionales.
-Estilo de copies: directo, usa flechas → para listar beneficios, emojis moderados (1-2 por bloque), frases cortas e impactantes, siempre termina con CTA al link de la bio y 3-5 hashtags. Hashtags frecuentes: #EBDS #FormaciónOnline #DesarrolloProfesional #TransformaciónDigital #MBADigital
+    'EBDS': """European Business & Digital School (EBDS). Formación profesional online: Diplomados (6 meses) y Másteres (12 meses) con diploma y certificado propio apostillado por la Convención de La Haya.
+
+TERMINOLOGÍA OBLIGATORIA: SIEMPRE usar "Diplomado", "Máster", "certificado" o "diploma". NUNCA escribir "titulación" ni "título" — es diploma propio, no título universitario oficial.
+
+PROGRAMAS REALES (úsalos exactamente así, no inventes otros):
+Diplomado y Máster: Marketing, Transformación Digital, Data Analytics, Prevención y Gestión de Riesgos Laborales, Recursos Humanos, Administración de Empresas, Mindfulness, Programación / Diseño Web y Gestión IT, Customer Success, Contabilidad y Finanzas.
+Solo Diplomado: Habilidades Gerenciales.
+Solo Máster: Marketing Digital, Inteligencia Artificial, IA Generativa y Marketing Digital.
+
+DIFERENCIADORES: certificación europea apostillada (Convención de La Haya), tutores que acompañan activamente (2-4 contactos/mes), 100% online y a tu ritmo, contenido aplicable desde el módulo 1, evaluaciones continuas (nota mínima 7/10), precio accesible con becas disponibles, inicio los días martes.
+
+AUDIENCIA: profesionales activos 25-45 años de Latinoamérica y España que quieren crecer sin pausar su vida laboral.
+
+TONO: aspiracional, empoderador, educativo, profesional. Español neutro — nunca voseo. Habla siempre del beneficio para el estudiante, no de la institución. Frases cortas, directas, con flechas → para beneficios, 1-2 emojis por bloque.
+
+PILARES DE CONTENIDO: programas y especialidades reales, beneficios del estudio online flexible, tips profesionales por área (marketing, datos, RRHH, etc.), diferenciadores vs universidad tradicional, motivación y crecimiento profesional, el sistema de microcredenciales (se puede empezar con 4 semanas a USD 119).
+
+HASHTAGS: #EBDS #FormaciónOnline #DesarrolloProfesional #CertificaciónEuropea #EstudiaOnline #EducaciónOnline
 Web: ebds.online""",
     'Sibila': """Sibila: plataforma omnicanal de comunicación empresarial con IA (WhatsApp Business, Email, SMS, chatbots y más, desde una sola interfaz). Audiencia: gerentes y responsables de atención al cliente en empresas medianas/grandes que quieren modernizar cómo se comunican con sus clientes y mejorar tiempos de respuesta. Tono: innovador, confiable, tecnológico pero cercano. Pilares: funcionalidades de la plataforma, casos de uso reales, ROI/eficiencia operativa, integraciones con otros sistemas, atención omnicanal con IA.
 Estilo de copies: enfocado en el problema del cliente (comunicación dispersa, lentitud), luego la solución (Sibila centraliza todo), siempre con dato o beneficio concreto. Emojis moderados. CTA al link de la bio. Hashtags: #Sibila #AtenciónAlCliente #Omnicanal #IA #Chatbot #CX
@@ -1803,7 +1951,7 @@ def generate_paid_media_pdf(client_name, meta_campaigns, crm_funnel=None, level=
     total_leads   = 0
     for c in meta_campaigns:
         for a in c.get('actions', []) or []:
-            if a.get('action_type') in ('lead', 'onsite_conversion.lead_grouped'):
+            if a.get('action_type') == 'onsite_conversion.lead_grouped':
                 total_leads += int(a.get('value', 0))
     cpl  = round(total_spend / total_leads, 2) if total_leads else 0
     ctr  = round(total_clicks / total_impr * 100, 2) if total_impr else 0
@@ -1868,7 +2016,7 @@ def generate_paid_media_pdf(client_name, meta_campaigns, crm_funnel=None, level=
     for camp in meta_campaigns[:15]:
         c_leads = 0
         for a in camp.get('actions', []) or []:
-            if a.get('action_type') in ('lead', 'onsite_conversion.lead_grouped'):
+            if a.get('action_type') == 'onsite_conversion.lead_grouped':
                 c_leads += int(a.get('value', 0))
         c_spend  = float(camp.get('spend', 0))
         c_clicks = int(camp.get('clicks', 0))
@@ -2192,13 +2340,12 @@ def check_new_posts(state):
     return state
 
 
-# ─── CALENDAR STORAGE (usa la state task existente, key "calendar") ──
+# ─── CALENDAR HELPERS ──────────────────────────────────────────────────────────
 
 def get_calendar_data(month_str=None):
-    """Lee datos del calendario usando read_state() (maneja base64 automáticamente)."""
+    """Lee datos del calendario desde su tarea dedicada."""
     try:
-        state = read_state()
-        all_data = state.get('calendar', {})
+        all_data = read_calendar()
         if month_str:
             return all_data.get(month_str, {})
         return all_data
@@ -2206,25 +2353,23 @@ def get_calendar_data(month_str=None):
         print(f'Cal get error: {e}')
         return {}
 
-def merge_calendar_into_state(state, month_str, month_data):
-    """Inserta datos de calendario en el dict de estado SIN guardar. Mantiene max 3 meses."""
-    all_data = state.get('calendar', {})
+def update_calendar_month(month_str, month_data):
+    """Actualiza un mes en el calendario. Operación atómica: read → merge → write.
+    Mantiene máximo 3 meses para controlar el tamaño."""
+    all_data = read_calendar()
     all_data[month_str] = month_data
     months = sorted(all_data.keys())
     if len(months) > 3:
         for old in months[:-3]:
             del all_data[old]
-    state['calendar'] = all_data
-    return state
+    save_calendar(all_data)
+    return all_data
 
-def save_calendar_data(month_str, month_data):
-    """Guarda datos de un mes en la state task. Usado desde /calendar/save (HTTP route)."""
-    try:
-        state = read_state()
-        state = merge_calendar_into_state(state, month_str, month_data)
-        save_state(state)
-    except Exception as e:
-        print(f'Cal save error: {e}')
+# Alias de compatibilidad para calendar/generate (que aún usa merge_calendar_into_state)
+def merge_calendar_into_state(state, month_str, month_data):
+    """Solo actualiza el calendario en su tarea dedicada. El state arg se ignora."""
+    update_calendar_month(month_str, month_data)
+    return state  # devuelve state sin tocar
 
 
 def get_posting_dates(year, month):
@@ -2273,19 +2418,19 @@ Sin saltos de línea literales en el JSON (usar \\n dentro del string).
 
 BRAND_STYLE_EXAMPLES = {
     'EBDS': """
-EJEMPLOS REALES DE CONTENIDO EBDS:
+EJEMPLOS DE CONTENIDO EBDS (estilo correcto de marca):
 
 POST:
-texto_imagen: "¿Piensas en formarte, especializarte o dar un salto profesional?\\nTu momento de crecer es ahora.\\n(logo EBDS)"
-copy: "🎓 Formación online que transforma carreras.\\nNuestros programas están diseñados para profesionales que no se conforman con menos.\\n→ Tecnología aplicada\\n→ Docentes con experiencia real\\n→ Titulación europea\\nDa el salto que estás esperando. 🔗 Link en la bio.\\n#EBDS #FormaciónOnline #DesarrolloProfesional"
+texto_imagen: "¿Quieres crecer profesionalmente sin pausar tu vida?\\nTu formación, tu ritmo.\\n(logo EBDS)"
+copy: "📚 Diplomados y Másteres online diseñados para profesionales que no se detienen.\\n→ Certificado europeo apostillado\\n→ Tutor que te acompaña cada semana\\n→ Contenido aplicable desde el módulo 1\\n→ 100% online, a tu ritmo\\nDa el próximo paso. 🔗 Link en la bio.\\n#EBDS #FormaciónOnline #DesarrolloProfesional #CertificaciónEuropea"
 
 CARRUSEL:
-texto_imagen: "S1: De Desarrollador a Líder\\nS2: Dominio Técnico → Experticia comprobable\\nS3: Metodologías Ágiles → Scrum, Kanban, SAFe\\nS4: Gestión de Talento → Liderazgo de equipos\\nS5: Visión de Negocio 4.0 → Estrategia + tecnología\\nS6: ¿Listo para el siguiente nivel? → ebds.online"
-copy: "¿Eres desarrollador y quieres liderar equipos? 🚀\\nEl salto no es solo técnico — es de mentalidad.\\nTe mostramos el camino en 5 pasos →\\nNuestro Master en Gestión de Proyectos Tech te da las herramientas.\\n🔗 Link en la bio.\\n#EBDS #LiderazgoTech #GestiónDeProyectos #TransformaciónDigital"
+texto_imagen: "S1: ¿Por qué los profesionales eligen EBDS?\\nS2: Flexibilidad total → estudias cuando puedes, desde donde estás\\nS3: Tutor real → te acompaña 2 a 4 veces por mes\\nS4: Aplicás desde el módulo 1 → sin esperar al final\\nS5: Certificado europeo → apostillado por la Convención de La Haya\\nS6: Empezá el próximo martes → ebds.online"
+copy: "La formación que se adapta a tu vida — no al revés. 🎯\\nEstos son los 5 motivos por los que miles de profesionales eligen EBDS →\\n→ Flexible\\n→ Con tutor\\n→ Aplicable desde el día 1\\n→ Certificado europeo\\n→ Precio con beca\\n🔗 Conoce los programas — Link en la bio.\\n#EBDS #EstudiaOnline #FormaciónProfesional #EducaciónOnline"
 
 REEL:
-texto_imagen: "Gancho (0-3s): Alumno compartiendo pantalla del Campus Virtual EBDS, navegando con herramientas de IA\\nEscena 1 (3-10s): Muestra el módulo de IA: el alumno interactúa con modelos de lenguaje en tiempo real\\nEscena 2 (10-20s): Corte rápido — notificación de certificado completado, alumno sonriendo\\nEscena 3 (20-28s): Frase animada en pantalla sobre el beneficio profesional\\nNarración completa: \\'En EBDS no solo estudias. Desde el primer módulo trabajas con las herramientas que usan las mejores empresas. Inteligencia artificial, data analytics, gestión de proyectos. Formación online con titulación europea. Tu carrera empieza a cambiar hoy.\\'\\nTexto superpuesto: \\'No solo estudias. Aplicas.\\'\\nCTA final (28-35s): \\'Conoce nuestros programas — Link en la bio\\'"
-copy: "¿Sabías que nuestros alumnos usan IA desde el primer módulo? 🤖\\nEn EBDS no solo aprendes — aplicas en tiempo real.\\nFormación online con herramientas del futuro.\\n🔗 Programas en el link en la bio.\\n#EBDS #InteligenciaArtificial #FormaciónOnline #FuturoProfesional"
+texto_imagen: "Gancho (0-3s): Persona trabajando en laptop, recibe notificación: \\'Módulo 1 completado\\'\\nEscena 1 (3-10s): Muestra el campus virtual con el material del Máster en Data Analytics en pantalla\\nEscena 2 (10-20s): Videollamada breve con tutor — feedback personalizado\\nEscena 3 (20-28s): Diploma digital con sello europeo, persona sonriendo\\nNarración completa: \\'En EBDS aprendes a tu ritmo, pero no estás solo. Desde el primer módulo aplicas lo que aprendes. Con un tutor que te acompaña y un certificado europeo al finalizar. Todo online, sin pausar tu vida.\\'\\nTexto superpuesto: \\'Tu ritmo. Tu carrera. Tu momento.\\'\\nCTA final (28-35s): \\'Conoce los Diplomados y Másteres — Link en la bio\\'"
+copy: "Estudiar no tiene que ser sinónimo de sacrificar todo. 🎓\\nEn EBDS aprendes a tu ritmo, con tutor real y certificado europeo.\\n→ 100% online\\n→ Aplicás desde el módulo 1\\n→ Diploma apostillado\\n🔗 Diplomados y Másteres en el link de la bio.\\n#EBDS #FormaciónOnline #MásterOnline #CertificaciónEuropea"
 """,
     'Sibila': """
 EJEMPLOS DE CONTENIDO SIBILA:
@@ -2642,13 +2787,13 @@ h1{font-size:17px;font-weight:700;white-space:nowrap}
 .brand-tab{padding:5px 12px;border-radius:20px;border:2px solid;cursor:pointer;font-size:12px;font-weight:600;transition:all .2s;background:white}
 .main{padding:20px;max-width:1400px;margin:0 auto}
 .cal-wrap{background:white;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0}
-.cal-header{display:grid;grid-template-columns:48px repeat(5,1fr);background:#f8fafc;border-bottom:1px solid #e2e8f0}
-.cal-header div{padding:10px 8px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;text-align:center;letter-spacing:.5px}
-.cal-body{display:grid;grid-template-columns:48px repeat(5,1fr)}
-.week-lbl{background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;align-items:flex-start;justify-content:center;padding-top:12px;font-size:11px;color:#94a3b8;font-weight:600}
-.day-cell{border-right:1px solid #f1f5f9;border-bottom:1px solid #f1f5f9;padding:6px;min-height:110px;transition:background .15s}
+.cal-header{display:grid;grid-template-columns:48px repeat(5,minmax(0,1fr));background:#f8fafc;border-bottom:1px solid #e2e8f0}
+.cal-header div{padding:10px 8px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;text-align:center;letter-spacing:.5px;overflow:hidden}
+.cal-body{display:grid;grid-template-columns:48px repeat(5,minmax(0,1fr));align-items:start}
+.week-lbl{background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;align-items:flex-start;justify-content:center;padding-top:12px;font-size:11px;color:#94a3b8;font-weight:600;min-height:110px}
+.day-cell{border-right:1px solid #f1f5f9;border-bottom:1px solid #f1f5f9;padding:6px;min-height:110px;transition:background .15s;overflow:hidden;width:100%}
 .day-cell:hover{background:#fafafa}
-.day-cell.inactive{background:#fafafa;opacity:.4}
+.day-cell.inactive{background:#fafafa;opacity:.55}
 .day-num{font-size:11px;color:#94a3b8;margin-bottom:5px;font-weight:500}
 .chip{display:flex;align-items:center;gap:3px;padding:4px 7px;border-radius:6px;margin-bottom:3px;cursor:pointer;transition:opacity .2s;font-size:11px;border:1px solid transparent}
 .chip:hover{opacity:.8;transform:translateY(-1px)}
@@ -2683,6 +2828,10 @@ textarea{min-height:90px;resize:vertical}
 .btn-cancel{background:#f1f5f9;color:#64748b;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:13px}
 .btn-regen{background:none;border:none;cursor:pointer;font-size:15px;padding:2px 5px;border-radius:5px;opacity:.6;transition:opacity .2s,background .2s;line-height:1}
 .btn-regen:hover{opacity:1;background:#f0fdf4}
+.btn-del{background:none;border:none;cursor:pointer;font-size:11px;padding:1px 3px;border-radius:4px;opacity:.45;color:#dc2626;transition:opacity .2s,background .2s;line-height:1;flex-shrink:0}
+.btn-del:hover{opacity:1;background:#fee2e2}
+.btn-delete{background:#fee2e2;color:#dc2626;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:background .2s;margin-left:auto}
+.btn-delete:hover{background:#fecaca}
 .regen-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1001;align-items:center;justify-content:center}
 .regen-overlay.show{display:flex}
 .regen-modal{background:white;border-radius:14px;padding:28px;width:min(420px,92vw);box-shadow:0 20px 60px rgba(0,0,0,.25)}
@@ -2856,8 +3005,21 @@ function renderCal(){
         const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=d.getDate();
         cell.appendChild(dn);
         getForDate(ds).forEach(p=>cell.appendChild(mkChip(p)));
-        if([1,3,5].includes(dow)){const ab=document.createElement(\'div\');ab.className=\'add-btn\';ab.innerHTML=\'+\';ab.title=\'Agregar\';ab.onclick=()=>openNew(ds);cell.appendChild(ab);}
-      }else{cell.className+=\' inactive\';}
+        const ab=document.createElement(\'div\');ab.className=\'add-btn\';ab.innerHTML=\'+\';ab.title=\'Agregar\';ab.onclick=()=>openNew(ds);cell.appendChild(ab);
+      }else{
+        // Celda vacía: calcular qué día sería para mostrar el número
+        cell.className+=\' inactive\';
+        // Buscar el lunes de esta semana y sumar (dow-1) días
+        const monDate=Object.values(w)[0];
+        if(monDate){
+          const dayOffset=dow-monDate.getDay();
+          const emptyDate=new Date(monDate.getTime()+dayOffset*86400000);
+          if(emptyDate.getMonth()===monDate.getMonth()){
+            const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=emptyDate.getDate();
+            cell.appendChild(dn);
+          }
+        }
+      }
       body.appendChild(cell);
     }
   });
@@ -2883,6 +3045,7 @@ function mkChip(p){
     +\'<span class="chip-title">\'+(p.titulo||p.type)+\'</span>\'
     +\'<span class="chip-icon">\'+icon+\'</span>\'
     +\'<button class="btn-regen" style="font-size:11px;padding:1px 3px" title="Regenerar" onclick="openRegen(\'+cpKey+\',event)">🔄</button>\'
+    +\'<button class="btn-del" title="Borrar" onclick="confirmDeleteChip(\'+cpKey+\',event)">✕</button>\'
     +\'<div class="chip-status" style="background:\'+(SC[p.status]||\'#94a3b8\')+\'"></div>\';
   chip.onclick=()=>openPost(p);return chip;
 }
@@ -2961,8 +3124,15 @@ function openPost(p){
     \'<span style="color:\'+bc2+\'">\'+p.brand+\'</span> &middot; \'
     +\'<span style="color:\'+tc+\'">\'+( TI[p.type]||\'\')+\' \'+p.type+\'</span>\'
     +(p.date?\' &middot; <span style="color:#94a3b8">\'+p.date+\'</span>\':\'\'  );
+  const typeOpts=[\'Reel\',\'Post\',\'Carrusel\',\'LinkedIn\',\'Blog\',\'Email\'];
+  const typeIcons={Reel:\'🎥\',Post:\'📝\',Carrusel:\'📱\',LinkedIn:\'💼\',Blog:\'📄\',Email:\'✉️\'};
+  const typeSelectOpts=typeOpts.map(t=>\'<option value="\'+t+\'"\'+(p.type===t?\' selected\':\'\')+\'>\'+( typeIcons[t]||\'\')+\' \'+t+\'</option>\').join(\'\');
   document.getElementById(\'modal-body\').innerHTML=
-    \'<label>T&iacute;tulo / Tema</label><input id="e-titulo" value="\'+esc(p.titulo||\'\')+\'">\'
+    \'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">\'
+    +\'<div><label>Tipo de formato</label><select id="e-type" onchange="updateModalHeader()">\'+typeSelectOpts+\'</select></div>\'
+    +\'<div><label>&#128197; Fecha (cambi&aacute; para mover)</label><input type="date" id="e-date"></div>\'
+    +\'</div>\'
+    +\'<label>T&iacute;tulo / Tema</label><input id="e-titulo" value="\'+esc(p.titulo||\'\')+\'">\'
     +\'<label>Pilar de contenido</label><input id="e-pilar" value="\'+esc(p.pilar||\'\')+\'">\'
     +\'<label>Objetivo</label><input id="e-objetivo" value="\'+esc(p.objetivo||\'\')+\'">\'
     +\'<label>&#127912; Texto de imagen / Descripci&oacute;n de pieza</label><textarea id="e-texto-imagen" style="min-height:90px;font-family:monospace;font-size:12px">\'+esc(p.texto_imagen||\'\')+\'</textarea>\'
@@ -2975,16 +3145,33 @@ function openPost(p){
     +\'</select>\'
     +\'<label>Comentarios</label><textarea id="e-comments" style="min-height:60px">\'+esc(p.comments||\'\')+\'</textarea>\'
     +\'<div class="modal-actions"><button class="btn-save" onclick="savePost()">&#128190; Guardar</button>\'
-    +\'<button class="btn-cancel" onclick="closeModal()">Cancelar</button></div>\';
+    +\'<button class="btn-cancel" onclick="closeModal()">Cancelar</button>\'
+    +\'<button class="btn-delete" onclick="deletePost()">&#128465; Borrar</button></div>\';
   document.getElementById(\'overlay\').classList.remove(\'hidden\');
+  // Fix: input[type=date] value must be set via JS after innerHTML (HTML attribute is ignored by some browsers)
+  const dateEl=document.getElementById(\'e-date\');
+  if(dateEl)dateEl.value=p.date||\'\';
 }
 
 function openNew(ds){
   openPost({id:\'new-\'+Date.now(),brand:active!==\'all\'?active:\'EBDS\',date:ds,type:\'Post\',titulo:\'\',pilar:\'\',objetivo:\'\',texto_imagen:\'\',copy:\'\',hashtags:\'\',status:\'pendiente\',comments:\'\'});
 }
 
+function updateModalHeader(){
+  if(!curPost)return;
+  const t=document.getElementById(\'e-type\');
+  if(!t)return;
+  const typeIcons2={Reel:\'🎥\',Post:\'📝\',Carrusel:\'📱\',LinkedIn:\'💼\',Blog:\'📄\',Email:\'✉️\'};
+  const bc2=BC[curPost.brand]||\'#666\';const tc2=TC[t.value]||\'#666\';
+  document.getElementById(\'modal-title\').innerHTML=
+    \'<span style="color:\'+bc2+\'">\'+curPost.brand+\'</span> &middot; \'
+    +\'<span style="color:\'+tc2+\'">\'+( typeIcons2[t.value]||\'\')+\' \'+t.value+\'</span>\';
+}
+
 async function savePost(){
   const p={...curPost,
+    type:document.getElementById(\'e-type\').value,
+    date:document.getElementById(\'e-date\').value,
     titulo:document.getElementById(\'e-titulo\').value,
     pilar:document.getElementById(\'e-pilar\').value,
     objetivo:document.getElementById(\'e-objetivo\').value,
@@ -2994,15 +3181,41 @@ async function savePost(){
     comments:document.getElementById(\'e-comments\').value
   };
   const eh=document.getElementById(\'e-hashtags\');if(eh)p.hashtags=eh.value;
+  // Si cambió la fecha, hay que remover el post del brand original antes de re-insertar
+  const oldBrand=curPost.brand;
   try{
     const r=await fetch(\'/calendar/save?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post:p})});
     if(r.ok){
       if(!data[p.brand])data[p.brand]=[];
       const idx=data[p.brand].findIndex(x=>x.id===p.id);
       if(idx>=0)data[p.brand][idx]=p;else data[p.brand].push(p);
-      closeModal();renderCal();renderExtras();
+      closeModal();renderCal();renderAgenda();renderExtras();
     }
   }catch(e){alert(\'Error al guardar\');}
+}
+
+async function deletePost(){
+  if(!curPost)return;
+  if(!confirm(\'¿Borrar este post? Esta acción no se puede deshacer.\'))return;
+  try{
+    const r=await fetch(\'/calendar/delete?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post_id:curPost.id,brand:curPost.brand})});
+    if(r.ok){
+      if(data[curPost.brand])data[curPost.brand]=data[curPost.brand].filter(x=>x.id!==curPost.id);
+      closeModal();renderCal();renderAgenda();renderExtras();
+    }else{alert(\'Error al borrar\');}
+  }catch(e){alert(\'Error al borrar\');}
+}
+
+async function confirmDeleteChip(p,e){
+  e.stopPropagation();
+  if(!confirm(\'¿Borrar "\'+(p.titulo||p.type)+\'"?\'))return;
+  try{
+    const r=await fetch(\'/calendar/delete?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post_id:p.id,brand:p.brand})});
+    if(r.ok){
+      if(data[p.brand])data[p.brand]=data[p.brand].filter(x=>x.id!==p.id);
+      renderCal();renderAgenda();renderExtras();
+    }
+  }catch(e){alert(\'Error al borrar\');}
 }
 
 function closeModal(){document.getElementById(\'overlay\').classList.add(\'hidden\');}
@@ -3142,6 +3355,96 @@ def debug_validar():
     out['notified_count'] = len(read_state().get('notified_validar_tasks', []))
     return Response(json.dumps(out, indent=2, ensure_ascii=False), mimetype='application/json')
 
+@app.route('/debug/zoho-deal-fields')
+def debug_zoho_deal_fields():
+    """Muestra todos los campos de un deal real para identificar nombre de campo 'fecha matriculado'."""
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    try:
+        # Fetch one deal with all fields
+        raw = zoho_get('Deals', {'per_page': 1})
+        sample = raw.get('data', [{}])[0]
+        # Also try the Zoho fields metadata
+        out = {
+            'sample_deal_all_fields': sample,
+            'date_like_fields': {k: v for k, v in sample.items()
+                                 if v and ('date' in k.lower() or 'fecha' in k.lower()
+                                           or 'matric' in k.lower() or 'inscri' in k.lower())},
+            'all_field_names': sorted(sample.keys()),
+        }
+        # Fetch matriculado deals with the key fields we need
+        matric = _zoho_get_all('Deals', {
+            'fields': 'Stage,Unidad_de_Negocio,Instituci_n,Created_Time,Modified_Time,Fecha_Matriculado,Closing_Date',
+            'criteria': "(Stage:equals:8. Validado para facturar comisión)"
+        }, max_pages=1)
+        if not matric:
+            matric = _zoho_get_all('Deals', {
+                'fields': 'Stage,Unidad_de_Negocio,Instituci_n,Created_Time,Modified_Time,Fecha_Matriculado,Closing_Date',
+                'criteria': "(Stage:equals:6. Inscrito)"
+            }, max_pages=1)
+        out['sample_matriculado'] = matric[:5] if matric else []
+        # Also show unique Instituci_n values from all deals
+        all_deals_inst = _zoho_get_all('Deals', {'fields': 'Stage,Instituci_n,Fecha_Matriculado'}, max_pages=1)
+        out['unique_instituciones'] = list({d.get('Instituci_n','') for d in all_deals_inst if d.get('Instituci_n')})[:20]
+        out['matriculado_count_all'] = sum(1 for d in all_deals_inst if d.get('Fecha_Matriculado'))
+        return Response(json.dumps(out, indent=2, ensure_ascii=False, default=str), mimetype='application/json')
+    except Exception as e:
+        return Response(json.dumps({'error': str(e)}), mimetype='application/json')
+
+
+@app.route('/debug/paid-media-raw')
+def debug_paid_media_raw():
+    """Muestra datos crudos de Meta Ads y CRM BHU para diagnóstico."""
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    month_param = request.args.get('month', '')
+    today = dt.date.today()
+    if month_param and len(month_param) == 7:
+        try:
+            yr, mo = int(month_param[:4]), int(month_param[5:])
+            if (yr, mo) < (today.year, today.month):
+                import calendar as _cal
+                month_date = dt.date(yr, mo, _cal.monthrange(yr, mo)[1])
+            else:
+                month_date = today
+        except Exception:
+            month_date = today
+    else:
+        month_date = today
+
+    out = {'month_date': str(month_date), 'since': str(month_date.replace(day=1)), 'until': str(min(month_date, today))}
+
+    # Meta raw
+    try:
+        rows = fetch_meta_monthly(is_ebds=False, month_date=month_date)
+        out['meta_rows_count'] = len(rows)
+        out['meta_campaigns'] = list({r.get('campaign_name','?') for r in rows})
+        out['meta_sample'] = [
+            {'campaign': r.get('campaign_name',''), 'adset': r.get('adset_name',''),
+             'spend': r.get('spend'), 'impressions': r.get('impressions'),
+             'leads': _leads(r), 'actions': r.get('actions',[])}
+            for r in rows[:5]
+        ]
+        out['meta_total_leads'] = sum(_leads(r) for r in rows)
+        out['meta_total_spend'] = sum(float(r.get('spend',0)) for r in rows)
+    except Exception as e:
+        out['meta_error'] = str(e)
+
+    # CRM raw
+    try:
+        crm = zoho_crm_funnel()
+        out['crm_funnel'] = crm.get('funnel', {})
+        out['crm_stages_raw'] = crm.get('stages_raw', {})
+        out['crm_deals_total'] = crm.get('deals_total', 0)
+        out['crm_ventas_mes'] = crm.get('ventas_mes', '?')
+    except Exception as e:
+        out['crm_error'] = str(e)
+
+    return Response(json.dumps(out, indent=2, ensure_ascii=False), mimetype='application/json')
+
+
 @app.route('/debug')
 def debug_route():
     results = {}
@@ -3265,7 +3568,7 @@ def calendar_generate():
             year, mo = int(month_str[:4]), int(month_str[5:])
             posting_dates = get_posting_dates(year, mo)
             assignments   = assign_formats(brands, posting_dates)
-            calendar_data = state.get('calendar', {}).get(month_str) or {}
+            calendar_data = read_calendar().get(month_str) or {}
 
             slots = [(d, brands_day[brand]) for d, brands_day in sorted(assignments.items()) if brand in brands_day]
             social   = generate_social_posts(brand, month_label, slots)
@@ -3275,8 +3578,8 @@ def calendar_generate():
             emails   = [] if brand == 'ZoWeAre' else generate_email_posts(brand, month_label, 3)
 
             calendar_data[brand] = social + linkedin + blog + emails
-            # Merge en el state actual y avanzar idx — un solo save_state al final
-            state = merge_calendar_into_state(state, month_str, calendar_data)
+            # Guardar en tarea de calendario — independiente del bot state
+            update_calendar_month(month_str, calendar_data)
             tg_send(f'✅ *{brand}* generado — {len(social)} posts · {len(linkedin)} LinkedIn · {len(blog)} blog · {len(emails)} emails')
         except Exception as e:
             print(f'Calendar gen {brand}: {e}')
@@ -3284,7 +3587,7 @@ def calendar_generate():
 
         pending['idx'] = idx + 1
         state['pending_calendar'] = pending
-        save_state(state)  # único save que incluye calendar + pending actualizado
+        save_state(state)  # solo guarda el bot state (pending, offset, etc.) — SIN calendario
     except Exception as e:
         print(f'calendar_generate error: {e}')
     return Response('OK', status=200)
@@ -3333,6 +3636,7 @@ def calendar_data_route():
 
 @app.route('/calendar/save', methods=['POST'])
 def calendar_save_route():
+    """Guarda/actualiza un post individual. Lee y escribe SOLO la tarea de calendario."""
     key = request.args.get('key', '')
     if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
         return Response('Unauthorized', status=401)
@@ -3341,21 +3645,98 @@ def calendar_save_route():
     post = body.get('post')
     if not month_str or not post:
         return Response('Bad request', status=400)
-    month_data = get_calendar_data(month_str) or {}
     brand = post.get('brand', '')
-    if brand:
-        if brand not in month_data:
-            month_data[brand] = []
-        idx = next((i for i, p in enumerate(month_data[brand]) if p.get('id') == post.get('id')), -1)
-        if idx >= 0:
-            month_data[brand][idx] = post
+    if not brand:
+        return Response('Bad request — falta brand en el post', status=400)
+    # Lectura y escritura SOLO en la tarea de calendario
+    all_data  = read_calendar()
+    month_data = all_data.get(month_str, {})
+    if brand not in month_data:
+        month_data[brand] = []
+    idx = next((i for i, p in enumerate(month_data[brand]) if p.get('id') == post.get('id')), -1)
+    if idx >= 0:
+        month_data[brand][idx] = post
+    else:
+        month_data[brand].append(post)
+    all_data[month_str] = month_data
+    months = sorted(all_data.keys())
+    if len(months) > 3:
+        for old in months[:-3]:
+            del all_data[old]
+    save_calendar(all_data)
+    return Response('OK', status=200)
+
+@app.route('/calendar/replace-brand', methods=['POST'])
+def calendar_replace_brand_route():
+    """Reemplaza TODOS los posts de una marca en un mes — atómico en la tarea de calendario.
+    Body: {month, brand, posts: [...]}
+    """
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    body = request.get_json() or {}
+    month_str = body.get('month')
+    brand     = body.get('brand')
+    new_posts = body.get('posts', [])
+    if not month_str or not brand:
+        return Response('Bad request — se requiere month y brand', status=400)
+    # Compactar: texto_imagen conservado en sociales (cap 200), omitido en LI/Blog/Email
+    SOCIAL_TYPES = {'Post', 'Carrusel', 'Reel'}
+    COPY_LIMITS  = {'Blog': 400, 'Email': 400, 'LinkedIn': 400}
+    compact_posts = []
+    for p in new_posts:
+        t  = p.get('type', '')
+        cp = dict(p)
+        if t in SOCIAL_TYPES:
+            ti = cp.get('texto_imagen', '')
+            if ti and len(ti) > 200:
+                cp['texto_imagen'] = ti[:200]
         else:
-            month_data[brand].append(post)
-    save_calendar_data(month_str, month_data)
+            cp.pop('texto_imagen', None)
+        lim = COPY_LIMITS.get(t)
+        if lim and len(cp.get('copy', '')) > lim:
+            cp['copy'] = cp['copy'][:lim]
+        compact_posts.append(cp)
+    # Lectura y escritura SOLO en la tarea de calendario
+    all_data   = read_calendar()
+    month_data = all_data.get(month_str, {})
+    month_data[brand] = compact_posts
+    all_data[month_str] = month_data
+    months = sorted(all_data.keys())
+    if len(months) > 3:
+        for old in months[:-3]:
+            del all_data[old]
+    save_calendar(all_data)
+    return Response(json.dumps({'ok': True, 'brand': brand, 'month': month_str,
+                                'posts': len(new_posts)}), status=200,
+                    mimetype='application/json')
+
+@app.route('/calendar/delete', methods=['POST'])
+def calendar_delete_route():
+    """Elimina un post. Lee y escribe SOLO la tarea de calendario."""
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    body = request.get_json() or {}
+    month_str = body.get('month')
+    post_id   = body.get('post_id')
+    brand     = body.get('brand')
+    if not month_str or not post_id:
+        return Response('Bad request', status=400)
+    all_data   = read_calendar()
+    month_data = all_data.get(month_str, {})
+    if brand and brand in month_data:
+        month_data[brand] = [p for p in month_data[brand] if p.get('id') != post_id]
+    else:
+        for b in month_data:
+            month_data[b] = [p for p in month_data[b] if p.get('id') != post_id]
+    all_data[month_str] = month_data
+    save_calendar(all_data)
     return Response('OK', status=200)
 
 @app.route('/calendar/regenerate-post', methods=['POST'])
 def calendar_regenerate_post_route():
+    """Regenera un post con IA. Lee y escribe SOLO la tarea de calendario."""
     key = request.args.get('key', '')
     if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
         return Response('Unauthorized', status=401)
@@ -3365,8 +3746,8 @@ def calendar_regenerate_post_route():
     instruction = body.get('instruction', '').strip()
     if not month_str or not post_id:
         return Response('Bad request', status=400)
-    month_data = get_calendar_data(month_str) or {}
-    # Find the post
+    all_data   = read_calendar()
+    month_data = all_data.get(month_str, {})
     found_post = None
     found_brand = None
     for brand, posts in month_data.items():
@@ -3386,7 +3767,8 @@ def calendar_regenerate_post_route():
                 if p.get('id') == post_id:
                     month_data[found_brand][i] = new_post
                     break
-            save_calendar_data(month_str, month_data)
+            all_data[month_str] = month_data
+            save_calendar(all_data)
             return Response(json.dumps(new_post, ensure_ascii=False), mimetype='application/json')
     except Exception as e:
         print(f'Regenerate post error: {e}')
@@ -3422,17 +3804,30 @@ def calculate_curva(month_date=None):
     return elapsed_w, total_w, pct
 
 def fetch_meta_monthly(is_ebds=False, month_date=None):
-    """Datos Meta Ads desde día 1 del mes hasta hoy, nivel adset."""
+    """Datos Meta Ads desde día 1 del mes hasta month_date (o hoy), nivel adset."""
     if month_date is None:
         month_date = dt.date.today()
     today = dt.date.today()
-    tr = json.dumps({'since': month_date.replace(day=1).isoformat(), 'until': today.isoformat()})
+    # until = el menor entre month_date y hoy (para meses pasados usa último día del mes)
+    until_date = min(month_date, today)
+    since_date = month_date.replace(day=1)
+    tr = json.dumps({'since': since_date.isoformat(), 'until': until_date.isoformat()})
     fields = 'campaign_name,adset_name,spend,impressions,clicks,ctr,cpm,cpc,reach,actions,cost_per_action_type'
     url = (f'https://graph.facebook.com/v21.0/act_2249213495344845/insights'
            f'?fields={urllib.parse.quote(fields)}&time_range={urllib.parse.quote(tr)}'
-           f'&level=adset&limit=100&access_token={META_TOKEN}')
+           f'&level=adset&limit=200&access_token={META_TOKEN}')
     try:
-        rows = http_req(url).get('data', [])
+        resp = http_req(url)
+        rows = resp.get('data', [])
+        # Paginar si hay más resultados
+        next_url = resp.get('paging', {}).get('next')
+        while next_url and len(rows) < 500:
+            try:
+                r2 = http_req(next_url)
+                rows += r2.get('data', [])
+                next_url = r2.get('paging', {}).get('next')
+            except Exception:
+                break
     except Exception as e:
         print(f'fetch_meta_monthly error: {e}')
         rows = []
@@ -3443,7 +3838,7 @@ def fetch_meta_monthly(is_ebds=False, month_date=None):
 
 def _leads(row):
     return sum(int(a.get('value', 0)) for a in (row.get('actions') or [])
-               if a.get('action_type') in ('lead', 'onsite_conversion.lead_grouped'))
+               if a.get('action_type') == 'onsite_conversion.lead_grouped')
 
 def _is_remark(cn, an=''):
     t = (cn + ' ' + an).lower()
@@ -3456,6 +3851,38 @@ def _norm_prog(s):
                r'prospecting|prosp|conversiones?|tr[a\xe1]fico|awareness|branding)\b', '', s)
     s = re.sub(r'[^a-z\xe1\xe9\xed\xf3\xfa\xfc\xf1\s]', ' ', s)
     return ' '.join(s.split())
+
+# BHU/UIN: keyword in adset name → CRM program group label + list of matching CRM programs
+BHU_META_PROG_GROUPS = {
+    'ingenier': {
+        'label': 'Ingenierías',
+        'crm_progs': [
+            'Ingeniería Industrial y de Sistemas',
+            'Ingeniería en Sistemas Computacionales',
+            'Ingeniería en Software y redes',
+        ],
+    },
+    'proyectos': {
+        'label': 'M. Administración de Proyectos',
+        'crm_progs': ['Maestría en administración de proyectos'],
+    },
+    'derecho': {
+        'label': 'M. Derecho',
+        'crm_progs': [
+            'Maestría en Derecho Penal', 'Maestría en Amparo',
+            'Maestría en Derecho Fiscal', 'Maestría en Derecho Corporativo',
+            'Maestría en Criminología', 'Maestría en Juicios Orales',
+        ],
+    },
+}
+
+def _bhu_prog_match(adset_name):
+    """Returns (label, crm_prog_list) if adset matches a known BHU group, else None."""
+    an = adset_name.lower()
+    for keyword, grp in BHU_META_PROG_GROUPS.items():
+        if keyword in an:
+            return grp['label'], grp['crm_progs']
+    return None
 
 def _fuzzy_prog(adset_name, crm_progs):
     w1 = {w for w in _norm_prog(adset_name).split() if len(w) > 3}
@@ -3524,10 +3951,11 @@ def build_paid_media_html(client_name, meta_data, crm_data, month_date):
     promesa     = f.get('promesa_pago', 0)
     estudiantes = f.get('estudiantes', 0)
     perdidos    = f.get('perdidos', 0)
-
-    mql    = contactados + interesados + evaluando + promesa + estudiantes + perdidos
+    # ventas_mes = deals que llegaron a stage conversión en el mes (Modified_Time)
+    ventas      = (crm_data or {}).get('ventas_mes', estudiantes)
+    # mql_mes = deals creados en el mes (Created_Time)
+    mql    = (crm_data or {}).get('mql_mes', 0) or (contactados + interesados + evaluando + promesa + estudiantes + perdidos)
     sql    = contactados + interesados + evaluando + promesa
-    ventas = estudiantes
 
     leads_pct   = t_ld   / obj['leads']  * 100 if obj['leads']  else 0
     ventas_pct  = ventas / obj['ventas'] * 100 if obj['ventas'] else 0
@@ -3548,18 +3976,34 @@ def build_paid_media_html(client_name, meta_data, crm_data, month_date):
     # ── Programs cross-reference ─────────────────────────────────────
     top_progs = (crm_data or {}).get('top_programas', {})
     prog_meta = {}
+    covered_crm_progs = set()   # CRM programs already grouped under a BHU group key
+
     for row in prospc:
-        an   = row.get('adset_name', '')
-        prog, _ = _fuzzy_prog(an, list(top_progs.keys()))
-        key  = prog if prog else an[:50]
-        prog_meta.setdefault(key, {'spend': 0, 'leads': 0,
-                                   'crm': top_progs.get(prog, 0) if prog else 0,
-                                   'matched': bool(prog)})
+        an = row.get('adset_name', '')
+        bhu_match = _bhu_prog_match(an) if not is_ebds else None
+
+        if bhu_match:
+            label, crm_prog_list = bhu_match
+            key = label
+            if key not in prog_meta:
+                crm_count = sum(top_progs.get(p, 0) for p in crm_prog_list)
+                prog_meta[key] = {'spend': 0, 'leads': 0, 'crm': crm_count, 'matched': True}
+                covered_crm_progs.update(crm_prog_list)
+        else:
+            prog, _ = _fuzzy_prog(an, list(top_progs.keys()))
+            key = prog if prog else an[:50]
+            if key not in prog_meta:
+                prog_meta[key] = {'spend': 0, 'leads': 0,
+                                  'crm': top_progs.get(prog, 0) if prog else 0,
+                                  'matched': bool(prog)}
+
         prog_meta[key]['spend'] += float(row.get('spend', 0))
         prog_meta[key]['leads'] += _leads(row)
+
     for p, cnt in top_progs.items():
-        if p not in prog_meta:
+        if p not in prog_meta and p not in covered_crm_progs:
             prog_meta[p] = {'spend': 0, 'leads': 0, 'crm': cnt, 'matched': False}
+
     sorted_progs = sorted(prog_meta.items(), key=lambda x: -(x[1]['spend'] + x[1]['crm'] * 5))[:14]
 
     # ── Accionables ──────────────────────────────────────────────────
@@ -3712,6 +4156,64 @@ def build_paid_media_html(client_name, meta_data, crm_data, month_date):
         for k, v in list(crm_data['leads_por_fuente'].items())[:8]:
             fuentes_html += f'<tr><td>{k}</td><td>{v:,}</td></tr>'
         fuentes_html += '</tbody></table></div>'
+
+    # ── Asesores HTML ─────────────────────────────────────────────────
+    asesores_html = ''
+    asesores_list = (crm_data or {}).get('asesores', [])
+    if asesores_list:
+        total_leads_as = sum(a['leads'] for a in asesores_list)
+        total_opps_as  = sum(a['opps']  for a in asesores_list)
+        total_vent_as  = sum(a['ventas'] for a in asesores_list)
+        def _pct(n, d): return f'{n/d*100:.0f}%' if d else '—'
+        def _bar(n, d, color='#3b82f6'):
+            w = min(n/d*100, 100) if d else 0
+            return f'<div style="background:#f0f0f0;border-radius:3px;height:5px;width:60px;display:inline-block;vertical-align:middle"><div style="background:{color};border-radius:3px;height:5px;width:{w:.0f}%"></div></div>'
+
+        asesores_html = (
+            '<div class="tw"><table class="tbl">'
+            '<thead><tr>'
+            '<th style="width:18%">Asesor</th>'
+            '<th style="width:9%">Leads</th>'
+            '<th style="width:9%">Sin gestión</th>'
+            '<th style="width:9%">Intentos</th>'
+            '<th style="width:9%">Duplicado</th>'
+            '<th style="width:9%">Inválido</th>'
+            '<th style="width:9%">No contact.</th>'
+            '<th style="width:9%">Opps.</th>'
+            '<th style="width:9%">Ventas</th>'
+            '<th style="width:10%">% Conv.</th>'
+            '</tr></thead><tbody>'
+        )
+        for a in asesores_list:
+            ld = a['leads'] or 1
+            conv_color = '#16a34a' if a['conv_pct'] >= 2 else ('#d97706' if a['conv_pct'] >= 0.5 else '#dc2626')
+            asesores_html += (
+                f'<tr>'
+                f'<td><b>{a["nombre"]}</b></td>'
+                f'<td>{a["leads"]}</td>'
+                f'<td>{a["sin_gestion"]} <span style="color:var(--hint);font-size:10px">{_pct(a["sin_gestion"],ld)}</span></td>'
+                f'<td>{a["intentos"]} <span style="color:var(--hint);font-size:10px">{_pct(a["intentos"],ld)}</span></td>'
+                f'<td>{a["duplicado"]} <span style="color:var(--hint);font-size:10px">{_pct(a["duplicado"],ld)}</span></td>'
+                f'<td>{a["invalido"]} <span style="color:var(--hint);font-size:10px">{_pct(a["invalido"],ld)}</span></td>'
+                f'<td>{a["no_contactable"]} <span style="color:var(--hint);font-size:10px">{_pct(a["no_contactable"],ld)}</span></td>'
+                f'<td>{a["opps"]}</td>'
+                f'<td><b style="color:var(--green)">{a["ventas"]}</b></td>'
+                f'<td><b style="color:{conv_color}">{a["conv_pct"]}%</b> {_bar(a["ventas"], a["leads"], conv_color)}</td>'
+                f'</tr>'
+            )
+        # Fila total
+        conv_total = round(total_vent_as / total_leads_as * 100, 1) if total_leads_as else 0
+        asesores_html += (
+            f'<tr class="total-row">'
+            f'<td><b>TOTAL</b></td>'
+            f'<td><b>{total_leads_as}</b></td>'
+            f'<td colspan="5"></td>'
+            f'<td><b>{total_opps_as}</b></td>'
+            f'<td><b style="color:var(--green)">{total_vent_as}</b></td>'
+            f'<td><b>{conv_total}%</b></td>'
+            f'</tr>'
+            '</tbody></table></div>'
+        )
 
     # ── Remarketing KPI cards ─────────────────────────────────────────
     remark_kpis = ''
@@ -3892,6 +4394,7 @@ footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 
   <a class="nl active" href="#resumen">Resumen</a>
   <a class="nl" href="#meta">Meta Ads</a>
   <a class="nl" href="#crm">CRM</a>
+  <a class="nl" href="#asesores">Asesores</a>
   <a class="nl" href="#programas">Programas</a>
   <a class="nl" href="#remarketing">Remarketing</a>
   <a class="nl" href="#accionables">Accionables</a>
@@ -3929,7 +4432,7 @@ footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 
 
 <div class="kg">
   <div class="kpi">
-    <div class="kl">MQL (PIPELINE TOTAL)</div>
+    <div class="kl">MQL (OPORT. DEL MES)</div>
     <div class="kv">{fn(mql)}</div>
     <div class="ks">{fp(mql_rate)} de leads Meta → CRM</div>
   </div>
@@ -4054,9 +4557,9 @@ footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 
 
 <div class="mq">
   <div class="mb">
-    <div class="ml">MQL — Marketing Qualified</div>
+    <div class="ml">MQL — Oportunidades del mes</div>
     <div class="mv">{fn(mql)}</div>
-    <div class="ms">Todos los que pasaron a oportunidad &middot; {fp(mql_rate)} de leads Meta</div>
+    <div class="ms">Deals creados en el mes &middot; {fp(mql_rate)} de leads Meta</div>
   </div>
   <div class="mb g">
     <div class="ml">SQL — Pipeline Activo</div>
@@ -4068,9 +4571,16 @@ footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 
 {fuentes_html}
 </section>
 
-<!-- 04 PROGRAMAS -->
+<!-- 04 ASESORES -->
+<section class="sec" id="asesores">
+<div class="sh"><span class="sn">04</span><h2 class="st">Performance por asesor</h2><span class="sb">Leads y ventas del mes</span></div>
+{'<div class="al al-amber">Sin datos de asesores disponibles.</div>' if not asesores_list else ''}
+{asesores_html}
+</section>
+
+<!-- 05 PROGRAMAS -->
 <section class="sec" id="programas">
-<div class="sh"><span class="sn">04</span><h2 class="st">Inversi\xf3n por programa</h2><span class="sb">Meta ↔ CRM</span></div>
+<div class="sh"><span class="sn">05</span><h2 class="st">Inversi\xf3n por programa</h2><span class="sb">Meta ↔ CRM</span></div>
 <div class="al al-blue"><b>Matching autom\xe1tico:</b> ✓ = match confirmado &middot; ~ = aproximado (puede diferir en nomenclatura). Verific\xe1 y ajust\xe1 si es necesario.</div>
 <div class="tw">
 <table class="tbl">
@@ -4089,9 +4599,9 @@ footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 
 </div>
 </section>
 
-<!-- 05 REMARKETING -->
+<!-- 06 REMARKETING -->
 <section class="sec" id="remarketing">
-<div class="sh"><span class="sn">05</span><h2 class="st">Remarketing</h2><span class="sb">Campa\xf1as de retargeting</span></div>
+<div class="sh"><span class="sn">06</span><h2 class="st">Remarketing</h2><span class="sb">Campa\xf1as de retargeting</span></div>
 {remark_kpis}
 <div class="tw">
 <table class="tbl">
@@ -4103,9 +4613,9 @@ footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 
 </div>
 </section>
 
-<!-- 06 ACCIONABLES -->
+<!-- 07 ACCIONABLES -->
 <section class="sec" id="accionables">
-<div class="sh"><span class="sn">06</span><h2 class="st">Accionables</h2><span class="sb">Auto-generado</span></div>
+<div class="sh"><span class="sn">07</span><h2 class="st">Accionables</h2><span class="sb">Auto-generado</span></div>
 {acc_html}
 </section>
 
@@ -4139,16 +4649,56 @@ new IntersectionObserver(entries=>{{
 </html>'''
 
 
+def _parse_month_from_text(text):
+    """Detecta mes/año del texto. Devuelve 'YYYY-MM' o None (= mes actual)."""
+    t = text.lower()
+    months_es = {
+        'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,
+        'julio':7,'agosto':8,'septiembre':9,'octubre':10,'noviembre':11,'diciembre':12
+    }
+    import re
+    # Formato explícito: 2026-05, 05/2026, 05-2026
+    m = re.search(r'(20\d\d)[/-](\d{1,2})', t) or re.search(r'(\d{1,2})[/-](20\d\d)', t)
+    if m:
+        parts = m.groups()
+        if len(parts[0]) == 4:  # YYYY-MM
+            return f'{parts[0]}-{parts[1].zfill(2)}'
+        else:                   # MM-YYYY
+            return f'{parts[1]}-{parts[0].zfill(2)}'
+    # Nombre de mes en español
+    for name, num in months_es.items():
+        if name in t:
+            yr_m = re.search(r'20\d\d', t)
+            yr = int(yr_m.group()) if yr_m else dt.date.today().year
+            return f'{yr}-{str(num).zfill(2)}'
+    return None
+
 def h_paid_report(text, state):
-    """Genera link del reporte HTML paid media."""
+    """Genera link del reporte HTML paid media. Soporta mes específico."""
     t = text.lower()
     is_ebds = 'ebds' in t
     slug    = 'ebds' if is_ebds else 'bhu'
     key     = os.environ.get('CALENDAR_KEY', 'sofia2026mkt')
     client_name = 'EBDS' if is_ebds else 'BHU/UIN'
+
+    month_param = _parse_month_from_text(text)
     url = f'https://vercel-deploy-tan-one.vercel.app/report/paid-media?key={key}&client={slug}'
+    if month_param:
+        url += f'&month={month_param}'
+        # Nombre legible del mes
+        mnames = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio',
+                  'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre']
+        yr, mo = int(month_param[:4]), int(month_param[5:])
+        period_label = f'{mnames[mo]} {yr}'
+    else:
+        today = dt.date.today()
+        mnames = ['','Enero','Febrero','Marzo','Abril','Mayo','Junio',
+                  'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre']
+        period_label = f'{mnames[today.month]} {today.year} (mes actual)'
+
     tg_send(
-        f'\U0001f4ca *Reporte Paid Media — {client_name}*\n\n'
+        f'\U0001f4ca *Reporte Paid Media — {client_name}*\n'
+        f'_Período: {period_label}_\n\n'
         f'\U0001f517 {url}\n\n'
         f'_Abr\xed el link, guard\xe1 como HTML (Ctrl+S) y compart\xed._'
     )
@@ -4165,7 +4715,23 @@ def paid_media_report_route():
     client_param = request.args.get('client', 'bhu').lower()
     is_ebds      = (client_param == 'ebds')
     client_name  = 'EBDS' if is_ebds else 'BHU/UIN'
-    month_date   = dt.date.today()
+    # Soporte para ?month=YYYY-MM (default: mes actual, último día disponible = hoy)
+    month_param  = request.args.get('month', '')
+    if month_param and len(month_param) == 7:
+        try:
+            yr, mo = int(month_param[:4]), int(month_param[5:])
+            # Si el mes pedido es anterior al actual, usar el último día del mes
+            today = dt.date.today()
+            if (yr, mo) < (today.year, today.month):
+                import calendar as _cal
+                last_day = _cal.monthrange(yr, mo)[1]
+                month_date = dt.date(yr, mo, last_day)
+            else:
+                month_date = today.replace(year=yr, month=mo)
+        except Exception:
+            month_date = dt.date.today()
+    else:
+        month_date = dt.date.today()
 
     meta_data = []
     try:
@@ -4176,9 +4742,9 @@ def paid_media_report_route():
     crm_data = None
     try:
         if is_ebds and ZOHO_EBDS_REFRESH_TOKEN:
-            crm_data = zoho_crm_funnel_ebds()
+            crm_data = zoho_crm_funnel_ebds()  # TODO: add month_date support for EBDS
         elif not is_ebds and ZOHO_REFRESH_TOKEN:
-            crm_data = zoho_crm_funnel()
+            crm_data = zoho_crm_funnel(month_date=month_date)
     except Exception as e:
         print(f'paid_media_route crm error: {e}')
 
