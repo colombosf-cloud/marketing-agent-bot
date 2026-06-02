@@ -433,9 +433,17 @@ STATE_DEFAULTS = {
     'last_post_ids': {},
 }
 
-# Tarea dedicada SOLO para el calendario — nunca se toca desde crons/webhook
-CALENDAR_TASK_ID        = '86ahv938h'
-CALENDAR_BACKUP_TASK_ID = '86ahva45t'  # backup automático antes de cada escritura
+# Tareas dedicadas al calendario — una por marca para mantener payloads pequeños (~20KB c/u)
+# Nunca se tocan desde crons/webhook
+CALENDAR_TASK_ID        = '86ahv938h'   # tarea legacy / fallback
+CALENDAR_BACKUP_TASK_ID = '86ahva45t'   # backup de la tarea legacy
+CALENDAR_BRAND_TASKS = {
+    'EBDS':    '86ahvcnc2',
+    'Sibila':  '86ahvcnd9',
+    'ZoWeAre': '86ahvcneg',
+    'Tivenos': '86ahvcp1w',
+    'BHU':     '86ahvcpcx',
+}
 
 def _decode_task_desc(desc):
     """Decodifica base64 o JSON plano desde el campo description de una tarea ClickUp."""
@@ -473,28 +481,62 @@ def save_state(state):
     state['last_run'] = datetime.utcnow().isoformat() + 'Z'
     cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': _encode_for_clickup(state)})
 
-def read_calendar():
-    """Lee el calendario desde su tarea dedicada (CALENDAR_TASK_ID).
-    Completamente independiente del estado del bot."""
+def _brand_task(brand):
+    """Devuelve el task_id de ClickUp para una marca. Fallback a la tarea legacy."""
+    return CALENDAR_BRAND_TASKS.get(brand, CALENDAR_TASK_ID)
+
+def read_calendar_brand(brand, month_str=None):
+    """Lee los posts de UNA marca desde su tarea dedicada. Rápido (~15KB por marca)."""
     try:
-        task = cu_get(f'task/{CALENDAR_TASK_ID}')
-        return _decode_task_desc(task.get('description', '') or '')
+        task = cu_get(f'task/{_brand_task(brand)}')
+        data = _decode_task_desc(task.get('description', '') or '')
+        if month_str:
+            return data.get(month_str, [])
+        return data   # {month_str: [posts]}
     except Exception:
-        return {}
+        return {} if month_str is None else []
+
+def save_calendar_brand(brand, month_str, posts):
+    """Escribe los posts de UNA marca en su tarea dedicada.
+    Payload pequeño (~15KB) → rápido y sin timeouts."""
+    task_id = _brand_task(brand)
+    # Leer el estado actual de esa marca para no perder otros meses
+    try:
+        task = cu_get(f'task/{task_id}')
+        current = _decode_task_desc(task.get('description', '') or '')
+    except Exception:
+        current = {}
+    current[month_str] = posts
+    # Mantener máximo 3 meses por marca
+    months = sorted(current.keys())
+    if len(months) > 3:
+        for old in months[:-3]:
+            del current[old]
+    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(current)})
+
+def read_calendar():
+    """Lee el calendario completo (todas las marcas) para /calendar/data.
+    Hace una llamada por marca — se usa solo en carga de página."""
+    result = {}
+    for brand in CALENDAR_BRAND_TASKS:
+        try:
+            data = read_calendar_brand(brand)
+            result[brand] = data   # {month_str: [posts]}
+        except Exception:
+            pass
+    return result
 
 def save_calendar(calendar_data, backup=False):
-    """Guarda el calendario en su tarea dedicada. Nunca toca el estado del bot.
-    backup=True: copia el estado actual al backup antes de escribir (solo en operaciones bulk).
-    backup=False (default): escritura directa — 1 sola llamada a ClickUp, mucho más rápido."""
-    if backup:
-        try:
-            task = cu_get(f'task/{CALENDAR_TASK_ID}')
-            current_desc = task.get('description', '') or ''
-            if current_desc.strip():
-                cu_put(f'task/{CALENDAR_BACKUP_TASK_ID}', {'markdown_description': current_desc})
-        except Exception as e:
-            print(f'Calendar backup error (non-fatal): {e}')
-    cu_put(f'task/{CALENDAR_TASK_ID}', {'markdown_description': _encode_for_clickup(calendar_data)})
+    """Compatibilidad con replace-brand: calendar_data = {month_str: {brand: [posts]}}.
+    Distribuye cada marca a su tarea dedicada."""
+    for month_str, month_brands in calendar_data.items():
+        if not isinstance(month_brands, dict):
+            continue
+        for brand, posts in month_brands.items():
+            try:
+                save_calendar_brand(brand, month_str, posts)
+            except Exception as e:
+                print(f'save_calendar brand={brand}: {e}')
 
 # --- Helpers ---
 def detect_client(text):
@@ -2354,33 +2396,40 @@ def check_new_posts(state):
 # ─── CALENDAR HELPERS ──────────────────────────────────────────────────────────
 
 def get_calendar_data(month_str=None):
-    """Lee datos del calendario desde su tarea dedicada."""
+    """Lee datos del calendario (todas las marcas) desde las tareas dedicadas.
+    Devuelve {brand: [posts]} para un mes, o {month: {brand: [posts]}} sin mes."""
     try:
-        all_data = read_calendar()
-        if month_str:
-            return all_data.get(month_str, {})
-        return all_data
+        brands_data = {}
+        for brand in CALENDAR_BRAND_TASKS:
+            brand_months = read_calendar_brand(brand)  # {month_str: [posts]}
+            if month_str:
+                posts = brand_months.get(month_str, [])
+                if posts:
+                    brands_data[brand] = posts
+            else:
+                for m, posts in brand_months.items():
+                    if m not in brands_data:
+                        brands_data[m] = {}
+                    brands_data[m][brand] = posts
+        return brands_data
     except Exception as e:
         print(f'Cal get error: {e}')
         return {}
 
 def update_calendar_month(month_str, month_data):
-    """Actualiza un mes en el calendario. Operación atómica: read → merge → write.
-    Mantiene máximo 3 meses para controlar el tamaño."""
-    all_data = read_calendar()
-    all_data[month_str] = month_data
-    months = sorted(all_data.keys())
-    if len(months) > 3:
-        for old in months[:-3]:
-            del all_data[old]
-    save_calendar(all_data)
-    return all_data
+    """Actualiza un mes: escribe cada marca en su tarea dedicada."""
+    for brand, posts in month_data.items():
+        try:
+            save_calendar_brand(brand, month_str, posts)
+        except Exception as e:
+            print(f'update_calendar_month {brand}: {e}')
+    return month_data
 
-# Alias de compatibilidad para calendar/generate (que aún usa merge_calendar_into_state)
+# Alias de compatibilidad para calendar/generate
 def merge_calendar_into_state(state, month_str, month_data):
-    """Solo actualiza el calendario en su tarea dedicada. El state arg se ignora."""
+    """Actualiza el calendario por marca. El state arg se ignora."""
     update_calendar_month(month_str, month_data)
-    return state  # devuelve state sin tocar
+    return state
 
 
 def get_posting_dates(year, month):
@@ -3671,22 +3720,15 @@ def calendar_save_route():
     brand = post.get('brand', '')
     if not brand:
         return Response('Bad request — falta brand en el post', status=400)
-    # Lectura y escritura SOLO en la tarea de calendario
-    all_data  = read_calendar()
-    month_data = all_data.get(month_str, {})
-    if brand not in month_data:
-        month_data[brand] = []
-    idx = next((i for i, p in enumerate(month_data[brand]) if p.get('id') == post.get('id')), -1)
+    # Leer y escribir SOLO la tarea de esa marca (payload ~15KB en lugar de 107KB)
+    brand_data = read_calendar_brand(brand)      # {month_str: [posts]}
+    posts_list = brand_data.get(month_str, [])
+    idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
     if idx >= 0:
-        month_data[brand][idx] = post
+        posts_list[idx] = post
     else:
-        month_data[brand].append(post)
-    all_data[month_str] = month_data
-    months = sorted(all_data.keys())
-    if len(months) > 3:
-        for old in months[:-3]:
-            del all_data[old]
-    save_calendar(all_data)
+        posts_list.append(post)
+    save_calendar_brand(brand, month_str, posts_list)
     return Response('OK', status=200)
 
 @app.route('/calendar/replace-brand', methods=['POST'])
@@ -3720,16 +3762,8 @@ def calendar_replace_brand_route():
         if lim and len(cp.get('copy', '')) > lim:
             cp['copy'] = cp['copy'][:lim]
         compact_posts.append(cp)
-    # Lectura y escritura SOLO en la tarea de calendario
-    all_data   = read_calendar()
-    month_data = all_data.get(month_str, {})
-    month_data[brand] = compact_posts
-    all_data[month_str] = month_data
-    months = sorted(all_data.keys())
-    if len(months) > 3:
-        for old in months[:-3]:
-            del all_data[old]
-    save_calendar(all_data, backup=True)
+    # Escribir SOLO la tarea de esa marca (~15KB en lugar de 107KB)
+    save_calendar_brand(brand, month_str, compact_posts)
     return Response(json.dumps({'ok': True, 'brand': brand, 'month': month_str,
                                 'posts': len(new_posts)}), status=200,
                     mimetype='application/json')
@@ -3746,15 +3780,18 @@ def calendar_delete_route():
     brand     = body.get('brand')
     if not month_str or not post_id:
         return Response('Bad request', status=400)
-    all_data   = read_calendar()
-    month_data = all_data.get(month_str, {})
-    if brand and brand in month_data:
-        month_data[brand] = [p for p in month_data[brand] if p.get('id') != post_id]
+    if brand:
+        posts_list = read_calendar_brand(brand, month_str)
+        posts_list = [p for p in posts_list if p.get('id') != post_id]
+        save_calendar_brand(brand, month_str, posts_list)
     else:
-        for b in month_data:
-            month_data[b] = [p for p in month_data[b] if p.get('id') != post_id]
-    all_data[month_str] = month_data
-    save_calendar(all_data)
+        # sin brand: buscar en todas las marcas
+        for b in CALENDAR_BRAND_TASKS:
+            posts_list = read_calendar_brand(b, month_str)
+            filtered = [p for p in posts_list if p.get('id') != post_id]
+            if len(filtered) < len(posts_list):
+                save_calendar_brand(b, month_str, filtered)
+                break
     return Response('OK', status=200)
 
 @app.route('/calendar/restore-backup', methods=['POST'])
@@ -3790,29 +3827,24 @@ def calendar_regenerate_post_route():
     instruction = body.get('instruction', '').strip()
     if not month_str or not post_id:
         return Response('Bad request', status=400)
-    all_data   = read_calendar()
-    month_data = all_data.get(month_str, {})
-    found_post = None
-    found_brand = None
-    for brand, posts in month_data.items():
-        for p in posts:
+    # Buscar el post en las tareas de las marcas
+    found_post = None; found_brand = None
+    for b in CALENDAR_BRAND_TASKS:
+        posts_list = read_calendar_brand(b, month_str)
+        for p in posts_list:
             if p.get('id') == post_id:
-                found_post = p
-                found_brand = brand
-                break
-        if found_post:
-            break
+                found_post = p; found_brand = b; break
+        if found_post: break
     if not found_post:
         return Response('Post not found', status=404)
     try:
         new_post = regenerate_single_post(found_post, instruction)
         if new_post:
-            for i, p in enumerate(month_data[found_brand]):
+            posts_list = read_calendar_brand(found_brand, month_str)
+            for i, p in enumerate(posts_list):
                 if p.get('id') == post_id:
-                    month_data[found_brand][i] = new_post
-                    break
-            all_data[month_str] = month_data
-            save_calendar(all_data)
+                    posts_list[i] = new_post; break
+            save_calendar_brand(found_brand, month_str, posts_list)
             return Response(json.dumps(new_post, ensure_ascii=False), mimetype='application/json')
     except Exception as e:
         print(f'Regenerate post error: {e}')
