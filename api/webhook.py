@@ -482,18 +482,18 @@ def read_calendar():
     except Exception:
         return {}
 
-def save_calendar(calendar_data):
+def save_calendar(calendar_data, backup=False):
     """Guarda el calendario en su tarea dedicada. Nunca toca el estado del bot.
-    Antes de escribir, copia el estado actual al backup (para recuperación manual)."""
-    try:
-        # Rotar backup: leer el estado actual y copiarlo al backup ANTES de sobrescribir
-        task = cu_get(f'task/{CALENDAR_TASK_ID}')
-        current_desc = task.get('description', '') or ''
-        if current_desc.strip():
-            cu_put(f'task/{CALENDAR_BACKUP_TASK_ID}', {'markdown_description': current_desc})
-    except Exception as e:
-        print(f'Calendar backup error (non-fatal): {e}')
-    # Escribir el nuevo estado en la tarea principal
+    backup=True: copia el estado actual al backup antes de escribir (solo en operaciones bulk).
+    backup=False (default): escritura directa — 1 sola llamada a ClickUp, mucho más rápido."""
+    if backup:
+        try:
+            task = cu_get(f'task/{CALENDAR_TASK_ID}')
+            current_desc = task.get('description', '') or ''
+            if current_desc.strip():
+                cu_put(f'task/{CALENDAR_BACKUP_TASK_ID}', {'markdown_description': current_desc})
+        except Exception as e:
+            print(f'Calendar backup error (non-fatal): {e}')
     cu_put(f'task/{CALENDAR_TASK_ID}', {'markdown_description': _encode_for_clickup(calendar_data)})
 
 # --- Helpers ---
@@ -3192,17 +3192,29 @@ async function savePost(){
     comments:document.getElementById(\'e-comments\').value
   };
   const eh=document.getElementById(\'e-hashtags\');if(eh)p.hashtags=eh.value;
-  // Si cambió la fecha, hay que remover el post del brand original antes de re-insertar
-  const oldBrand=curPost.brand;
+  const btn=document.querySelector(\'.btn-save\');
+  const orig=btn?btn.innerHTML:\'\';
+  if(btn){btn.disabled=true;btn.style.opacity=\'0.7\';btn.innerHTML=\'⏳ Guardando...\';}
   try{
-    const r=await fetch(\'/calendar/save?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post:p})});
+    const ctrl=new AbortController();
+    const tid=setTimeout(()=>ctrl.abort(),25000);
+    const r=await fetch(\'/calendar/save?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post:p}),signal:ctrl.signal});
+    clearTimeout(tid);
     if(r.ok){
       if(!data[p.brand])data[p.brand]=[];
       const idx=data[p.brand].findIndex(x=>x.id===p.id);
       if(idx>=0)data[p.brand][idx]=p;else data[p.brand].push(p);
-      closeModal();renderCal();renderAgenda();renderExtras();
+      if(btn)btn.innerHTML=\'✅ Guardado\';
+      setTimeout(()=>{closeModal();renderCal();renderAgenda();renderExtras();},350);
+    }else{
+      if(btn){btn.disabled=false;btn.style.opacity=\'1\';btn.innerHTML=orig;}
+      alert(\'Error al guardar. Intentá de nuevo.\');
     }
-  }catch(e){alert(\'Error al guardar\');}
+  }catch(e){
+    if(btn){btn.disabled=false;btn.style.opacity=\'1\';btn.innerHTML=orig;}
+    if(e.name===\'AbortError\')alert(\'Tardó demasiado. El cambio puede haberse guardado — cerrá y verificá antes de reintentar.\');
+    else alert(\'Error de conexión al guardar.\');
+  }
 }
 
 async function deletePost(){
@@ -3717,7 +3729,7 @@ def calendar_replace_brand_route():
     if len(months) > 3:
         for old in months[:-3]:
             del all_data[old]
-    save_calendar(all_data)
+    save_calendar(all_data, backup=True)
     return Response(json.dumps({'ok': True, 'brand': brand, 'month': month_str,
                                 'posts': len(new_posts)}), status=200,
                     mimetype='application/json')
