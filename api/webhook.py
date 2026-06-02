@@ -3700,8 +3700,8 @@ def calendar_replace_brand_route():
         cp = dict(p)
         if t in SOCIAL_TYPES:
             ti = cp.get('texto_imagen', '')
-            if ti and len(ti) > 200:
-                cp['texto_imagen'] = ti[:200]
+            if ti and len(ti) > 600:
+                cp['texto_imagen'] = ti[:600]
         else:
             cp.pop('texto_imagen', None)
         lim = COPY_LIMITS.get(t)
