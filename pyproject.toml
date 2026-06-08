@@ -1,0 +1,12 @@
+[project]
+name = "marketing-agent-bot"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.28.0",
+    "flask>=3.0.0",
+    "fpdf2>=2.7.0",
+]
+
+[tool.vercel]
+entrypoint = "api.webhook:app"
