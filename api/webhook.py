@@ -2861,6 +2861,9 @@ h1{font-size:17px;font-weight:700;white-space:nowrap}
 .chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:#1e293b}
 .chip-icon{flex-shrink:0;font-size:10px}
 .chip-status{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.chip-mini{display:flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;margin-bottom:2px;cursor:pointer;border:1px dashed;font-size:10px;transition:opacity .15s}
+.chip-mini:hover{opacity:.75;transform:translateY(-1px)}
+.chip-mini-lbl{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .add-btn{display:block;text-align:center;color:#cbd5e1;cursor:pointer;font-size:16px;padding:2px;border-radius:4px;transition:all .15s;line-height:1}
 .add-btn:hover{background:#f1f5f9;color:#64748b}
 .extras{margin-top:24px}
@@ -3065,6 +3068,7 @@ function renderCal(){
         const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=d.getDate();
         cell.appendChild(dn);
         getForDate(ds).forEach(p=>cell.appendChild(mkChip(p)));
+        getExtrasForDate(ds).forEach(p=>cell.appendChild(mkMiniChip(p)));
         const ab=document.createElement(\'div\');ab.className=\'add-btn\';ab.innerHTML=\'+\';ab.title=\'Agregar\';ab.onclick=()=>openNew(ds);cell.appendChild(ab);
       }else{
         // Celda vacía: calcular qué día sería para mostrar el número
@@ -3095,6 +3099,29 @@ function getForDate(ds){
   return posts;
 }
 
+function getExtrasForDate(ds){
+  const posts=[];
+  for(const[brand,bp] of Object.entries(data)){
+    if(active!==\'all\'&&brand!==active)continue;
+    if(!Array.isArray(bp))continue;
+    bp.filter(p=>p.date===ds&&[\'LinkedIn\',\'Blog\',\'Email\'].includes(p.type)).forEach(p=>posts.push({...p,brand}));
+  }
+  return posts;
+}
+
+function mkMiniChip(p){
+  const tc=TC[p.type]||\'#666\';
+  const chip=document.createElement(\'div\');chip.className=\'chip-mini\';
+  chip.style.background=tc+\'15\';chip.style.borderColor=tc+\'55\';
+  const icon=TI[p.type]||\'\'
+  const pKey=\'pRef_\'+p.id.replace(/[^a-z0-9]/gi,\'_\');window[pKey]={...p};
+  chip.innerHTML=\'<span>\'+icon+\'</span>\'
+    +\'<span class="chip-mini-lbl" style="color:\'+tc+\'">\'+p.type+\'</span>\'
+    +\'<div class="chip-status" style="background:\'+(SC[p.status]||\'#94a3b8\')+\'"></div>\';
+  chip.onclick=(e)=>{e.stopPropagation();openPost(p);};
+  return chip;
+}
+
 function mkChip(p){
   const tc=TC[p.type]||\'#666\';const bc=BC[p.brand]||\'#888\';
   const chip=document.createElement(\'div\');chip.className=\'chip\';
@@ -3117,11 +3144,11 @@ function renderExtras(){
     for(const[brand,bp] of Object.entries(data)){
       if(active!==\'all\'&&brand!==active)continue;
       if(!Array.isArray(bp))continue;
-      bp.filter(p=>p.type===type).forEach(p=>posts.push({...p,brand}));
+      bp.filter(p=>p.type===type&&!p.date).forEach(p=>posts.push({...p,brand}));
     }
     if(!posts.length)return;
     const col=TC[type]||\'#666\';const icon=TI[type]||\'\';
-    const h=document.createElement(\'h3\');h.innerHTML=icon+\' \'+type+\' del mes\';h.style.color=col;
+    const h=document.createElement(\'h3\');h.innerHTML=icon+\' \'+type+\' sin fecha asignada\';h.style.color=col;
     c.appendChild(h);
     const grid=document.createElement(\'div\');grid.className=\'cards-grid\';
     posts.forEach(p=>{
