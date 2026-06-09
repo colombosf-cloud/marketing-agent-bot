@@ -2844,6 +2844,11 @@ h1{font-size:17px;font-weight:700;white-space:nowrap}
 .month-nav button:hover{background:#e2e8f0}
 .month-nav span{font-weight:600;min-width:130px;text-align:center;font-size:14px}
 .brand-tabs{display:flex;gap:5px;flex-wrap:wrap}
+.gen-btn{background:#7c3aed;color:white;border:none;padding:6px 14px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:opacity .2s;white-space:nowrap;margin-left:auto}
+.gen-btn:hover{opacity:.85}
+.gen-type-opt{display:flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid #e2e8f0;border-radius:8px;cursor:pointer;font-size:12px;font-weight:500;transition:background .15s}
+.gen-type-opt:hover{background:#f8f5ff}
+.gen-type-opt input{accent-color:#7c3aed}
 .brand-tab{padding:5px 12px;border-radius:20px;border:2px solid;cursor:pointer;font-size:12px;font-weight:600;transition:all .2s;background:white}
 .main{padding:20px;max-width:1400px;margin:0 auto}
 .cal-wrap{background:white;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0}
@@ -2948,7 +2953,50 @@ textarea{min-height:90px;resize:vertical}
     <button onclick="changeMonth(1)">&#9654;</button>
   </div>
   <div class="brand-tabs" id="brand-tabs"></div>
+  <button class="gen-btn" onclick="openGenModal()" title="Generar contenido con IA">✨ Generar</button>
 </header>
+
+<!-- Modal Generación IA -->
+<div class="overlay hidden" id="gen-overlay" onclick="if(event.target===this)closeGenModal()">
+  <div class="modal" style="max-width:440px">
+    <div class="modal-hd">
+      <h3>✨ Generar contenido con IA</h3>
+      <button class="close-btn" onclick="closeGenModal()">&#215;</button>
+    </div>
+    <div style="padding:16px;display:flex;flex-direction:column;gap:12px">
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:4px">MARCA</label>
+        <select id="gen-brand" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px">
+          <option value="">— Seleccioná —</option>
+          <option value="EBDS">EBDS</option>
+          <option value="Sibila">Sibila</option>
+          <option value="ZoWeAre">ZoWeAre</option>
+          <option value="Tivenos">Tivenos</option>
+          <option value="BHU">BHU</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:4px">MES</label>
+        <input type="month" id="gen-month" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:4px">TIPO DE CONTENIDO</label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px" id="gen-types">
+          <label class="gen-type-opt"><input type="radio" name="gen-type" value="social" checked> 📱 Posts sociales</label>
+          <label class="gen-type-opt"><input type="radio" name="gen-type" value="linkedin"> 💼 LinkedIn</label>
+          <label class="gen-type-opt"><input type="radio" name="gen-type" value="blog"> 📄 Blog</label>
+          <label class="gen-type-opt"><input type="radio" name="gen-type" value="email"> ✉️ Email</label>
+        </div>
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:4px">INSTRUCCIONES EXTRA <span style="font-weight:400">(opcional)</span></label>
+        <textarea id="gen-prompt" rows="3" placeholder="Ej: Esta semana hay una promo de 30% de descuento. Incluir urgencia y CTA a la landing de descuento." style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;resize:vertical;font-family:inherit"></textarea>
+      </div>
+      <div id="gen-status" style="font-size:12px;color:#64748b;min-height:18px;text-align:center"></div>
+      <button id="gen-submit-btn" onclick="runGenerate()" style="background:#7c3aed;color:white;border:none;padding:10px 0;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .2s">✨ Generar ahora</button>
+    </div>
+  </div>
+</div>
 <div class="main">
   <div class="legend" id="legend">
     <div class="legend-item"><div class="legend-dot" style="background:#16a34a"></div>Reel</div>
@@ -3380,6 +3428,67 @@ function changeMonth(d,autoAdvance){
 function esc(s){return String(s).replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\').replace(/"/g,\'&quot;\').replace(/\'/g,\'&#39;\');}
 
 if(document.readyState===\'loading\'){document.addEventListener(\'DOMContentLoaded\',load);}else{load();}
+
+// ===== MODAL GENERACIÓN IA =====
+function openGenModal(){
+  const ov=document.getElementById(\'gen-overlay\');
+  // Pre-seleccionar marca activa si hay una
+  if(active&&active!==\'all\'){
+    const sel=document.getElementById(\'gen-brand\');
+    if(sel)sel.value=active;
+  }
+  // Pre-seleccionar mes actual
+  document.getElementById(\'gen-month\').value=curMonth;
+  document.getElementById(\'gen-status\').textContent=\'\';
+  ov.classList.remove(\'hidden\');
+}
+
+function closeGenModal(){
+  document.getElementById(\'gen-overlay\').classList.add(\'hidden\');
+}
+
+async function runGenerate(){
+  const brand=document.getElementById(\'gen-brand\').value;
+  const month=document.getElementById(\'gen-month\').value;
+  const type=document.querySelector(\'input[name="gen-type"]:checked\')?.value||\'social\';
+  const prompt=document.getElementById(\'gen-prompt\').value.trim();
+
+  if(!brand){alert(\'Seleccioná una marca\');return;}
+  if(!month){alert(\'Seleccioná el mes\');return;}
+
+  const btn=document.getElementById(\'gen-submit-btn\');
+  const status=document.getElementById(\'gen-status\');
+  btn.disabled=true;btn.style.opacity=\'0.6\';
+  btn.textContent=\'⏳ Generando... (puede tardar 20-25s)\';
+  status.textContent=\'\';
+
+  try{
+    const ctrl=new AbortController();
+    const tid=setTimeout(()=>ctrl.abort(),29000);
+    const r=await fetch(\'/calendar/generate-web?key=\'+KEY,{
+      method:\'POST\',
+      headers:{\'Content-Type\':\'application/json\'},
+      body:JSON.stringify({brand,month,type,prompt}),
+      signal:ctrl.signal
+    });
+    clearTimeout(tid);
+    const d=await r.json();
+    if(d.ok){
+      status.style.color=\'#16a34a\';
+      status.textContent=\'✅ \'+d.count+\' piezas generadas para \'+brand+\'. Recargando...\';
+      setTimeout(()=>{closeGenModal();load();},900);
+    } else {
+      status.style.color=\'#ef4444\';
+      status.textContent=\'❌ \'+( d.error||\'Error desconocido\');
+      btn.disabled=false;btn.style.opacity=\'1\';btn.textContent=\'✨ Generar ahora\';
+    }
+  }catch(e){
+    const msg=e.name===\'AbortError\'?\'Tardó demasiado — el servidor puede estar generando. Esperá 30s y recargá el calendario.\':\'Error de red: \'+e.message;
+    status.style.color=\'#f59e0b\';
+    status.textContent=\'⚠️ \'+msg;
+    btn.disabled=false;btn.style.opacity=\'1\';btn.textContent=\'✨ Generar ahora\';
+  }
+}
 </script>
 
 <div class="regen-overlay" id="regen-overlay">
@@ -3690,6 +3799,88 @@ def calendar_generate():
     except Exception as e:
         print(f'calendar_generate error: {e}')
     return Response('OK', status=200)
+
+
+@app.route('/calendar/generate-web', methods=['POST'])
+def calendar_generate_web():
+    """Genera contenido para UNA marca desde la UI web — sin Telegram.
+    Body: {brand, month, type: 'social'|'linkedin'|'blog'|'email', prompt: '...extra...'}
+    Cada tipo se llama por separado para no exceder 30s de Vercel.
+    """
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return jsonify({'ok': False, 'error': 'Unauthorized'}), 401
+
+    body       = request.get_json(force=True) or {}
+    brand      = body.get('brand', '').strip()
+    month_str  = body.get('month', '').strip()   # "2026-06"
+    gen_type   = body.get('type', 'social')       # social | linkedin | blog | email
+    extra_prompt = (body.get('prompt') or '').strip()
+
+    if not brand or not month_str:
+        return jsonify({'ok': False, 'error': 'brand y month son requeridos'}), 400
+    if brand not in CALENDAR_BRAND_TASKS:
+        return jsonify({'ok': False, 'error': f'Marca desconocida: {brand}'}), 400
+
+    try:
+        year, mo  = int(month_str[:4]), int(month_str[5:])
+        from datetime import date as _date
+        month_label = _date(year, mo, 1).strftime('%B %Y')
+
+        # Si hay prompt extra, prependerlo al contexto de marca
+        original_ctx = BRAND_CONTEXT.get(brand, brand)
+        ctx_to_use   = (extra_prompt + '\n\n' + original_ctx) if extra_prompt else original_ctx
+        BRAND_CONTEXT[brand] = ctx_to_use
+
+        try:
+            all_brands    = list(CALENDAR_BRAND_TASKS.keys())
+            posting_dates = get_posting_dates(year, mo)
+            assignments   = assign_formats(all_brands, posting_dates)
+
+            # Posts existentes de esta marca/mes para merge
+            existing = read_calendar_brand(brand, month_str)
+
+            generated = []
+
+            if gen_type == 'social':
+                slots = [(d, bd[brand]) for d, bd in sorted(assignments.items()) if brand in bd]
+                generated = generate_social_posts(brand, month_label, slots)
+                # Merge: conservar linkedin/blog/email existentes
+                keep = [p for p in existing if p.get('type') in ('LinkedIn','Blog','Email')]
+                final = keep + generated
+
+            elif gen_type == 'linkedin':
+                li_count = 4 if brand == 'ZoWeAre' else 3
+                generated = generate_linkedin_posts(brand, month_label, li_count)
+                keep = [p for p in existing if p.get('type') != 'LinkedIn']
+                final = keep + generated
+
+            elif gen_type == 'blog':
+                if brand == 'ZoWeAre':
+                    return jsonify({'ok': False, 'error': 'ZoWeAre no tiene Blog'}), 400
+                generated = generate_blog_posts(brand, month_label, 2)
+                keep = [p for p in existing if p.get('type') != 'Blog']
+                final = keep + generated
+
+            elif gen_type == 'email':
+                if brand == 'ZoWeAre':
+                    return jsonify({'ok': False, 'error': 'ZoWeAre no tiene Email'}), 400
+                generated = generate_email_posts(brand, month_label, 3)
+                keep = [p for p in existing if p.get('type') != 'Email']
+                final = keep + generated
+
+            else:
+                return jsonify({'ok': False, 'error': f'Tipo inválido: {gen_type}'}), 400
+
+            save_calendar_brand(brand, month_str, final)
+            return jsonify({'ok': True, 'brand': brand, 'type': gen_type, 'count': len(generated)})
+
+        finally:
+            BRAND_CONTEXT[brand] = original_ctx  # restaurar siempre
+
+    except Exception as e:
+        print(f'generate-web error: {e}')
+        return jsonify({'ok': False, 'error': str(e[:200])}), 500
 
 
 @app.route('/cron/seo-report', methods=['GET', 'POST'])
