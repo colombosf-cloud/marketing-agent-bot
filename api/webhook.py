@@ -444,6 +444,16 @@ CALENDAR_BRAND_TASKS = {
     'Tivenos': '86ahvcp1w',
     'BHU':     '86ahvcpcx',
 }
+BRANDS_CONFIG_TASK_ID = '86ahyrq9c'   # config dinámica de marcas [NO BORRAR]
+
+# Config inicial de marcas hardcodeada como fallback — se migra a ClickUp en primera carga
+_BRANDS_DEFAULT = {
+    'EBDS':    {'color':'#1e3a8a','task_id':'86ahvcnc2'},
+    'Sibila':  {'color':'#7c3aed','task_id':'86ahvcnd9'},
+    'ZoWeAre': {'color':'#059669','task_id':'86ahvcneg'},
+    'Tivenos': {'color':'#dc2626','task_id':'86ahvcp1w'},
+    'BHU':     {'color':'#d97706','task_id':'86ahvcpcx'},
+}
 
 def _decode_task_desc(desc):
     """Decodifica base64 o JSON plano desde el campo description de una tarea ClickUp."""
@@ -537,6 +547,30 @@ def save_calendar(calendar_data, backup=False):
                 save_calendar_brand(brand, month_str, posts)
             except Exception as e:
                 print(f'save_calendar brand={brand}: {e}')
+
+# --- Brands config (dinámico) ---
+def read_brands_config():
+    """Lee la config de marcas desde ClickUp. Fallback a _BRANDS_DEFAULT."""
+    try:
+        task = cu_get(f'task/{BRANDS_CONFIG_TASK_ID}')
+        data = _decode_task_desc(task.get('description', '') or '')
+        if data:
+            return data
+    except Exception as e:
+        print(f'read_brands_config: {e}')
+    return dict(_BRANDS_DEFAULT)
+
+def save_brands_config(config):
+    """Guarda la config de marcas en ClickUp."""
+    cu_put(f'task/{BRANDS_CONFIG_TASK_ID}', {'markdown_description': _encode_for_clickup(config)})
+
+def get_brands_config():
+    """Lee config, si está vacía migra desde defaults y guarda."""
+    cfg = read_brands_config()
+    if not cfg:
+        cfg = dict(_BRANDS_DEFAULT)
+        save_brands_config(cfg)
+    return cfg
 
 # --- Helpers ---
 def detect_client(text):
@@ -2844,6 +2878,11 @@ h1{font-size:17px;font-weight:700;white-space:nowrap}
 .month-nav button:hover{background:#e2e8f0}
 .month-nav span{font-weight:600;min-width:130px;text-align:center;font-size:14px}
 .brand-tabs{display:flex;gap:5px;flex-wrap:wrap}
+.new-brand-btn{background:white;color:#1e293b;border:1px solid #e2e8f0;padding:6px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:background .15s;white-space:nowrap}
+.new-brand-btn:hover{background:#f8fafc}
+.nb-color-opt{display:inline-block;width:26px;height:26px;border-radius:50%;cursor:pointer;border:2px solid transparent;transition:transform .15s,border-color .15s}
+.nb-color-opt:hover{transform:scale(1.15)}
+.nb-color-opt.selected{border-color:#1e293b;transform:scale(1.15)}
 .gen-btn{background:#7c3aed;color:white;border:none;padding:6px 14px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:opacity .2s;white-space:nowrap;margin-left:auto}
 .gen-btn:hover{opacity:.85}
 .gen-type-opt{display:flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid #e2e8f0;border-radius:8px;cursor:pointer;font-size:12px;font-weight:500;transition:background .15s}
@@ -2953,8 +2992,45 @@ textarea{min-height:90px;resize:vertical}
     <button onclick="changeMonth(1)">&#9654;</button>
   </div>
   <div class="brand-tabs" id="brand-tabs"></div>
+  <button class="new-brand-btn" onclick="openNewBrand()" title="Agregar nueva marca">+ Marca</button>
   <button class="gen-btn" onclick="openGenModal()" title="Generar contenido con IA">✨ Generar</button>
 </header>
+
+<!-- Modal Nueva Marca -->
+<div class="overlay hidden" id="newbrand-overlay" onclick="if(event.target===this)closeNewBrand()">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-hd">
+      <h3>🏢 Nueva marca</h3>
+      <button class="close-btn" onclick="closeNewBrand()">&#215;</button>
+    </div>
+    <div style="padding:16px;display:flex;flex-direction:column;gap:12px">
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:4px">NOMBRE DE LA MARCA</label>
+        <input id="nb-name" type="text" maxlength="30" placeholder="Ej: MiMarca" style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:4px">COLOR</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap" id="nb-colors">
+          <span class="nb-color-opt" data-color="#6366f1" style="background:#6366f1" title="Índigo"></span>
+          <span class="nb-color-opt" data-color="#0ea5e9" style="background:#0ea5e9" title="Cielo"></span>
+          <span class="nb-color-opt" data-color="#10b981" style="background:#10b981" title="Esmeralda"></span>
+          <span class="nb-color-opt" data-color="#f59e0b" style="background:#f59e0b" title="Ámbar"></span>
+          <span class="nb-color-opt" data-color="#ef4444" style="background:#ef4444" title="Rojo"></span>
+          <span class="nb-color-opt" data-color="#ec4899" style="background:#ec4899" title="Rosa"></span>
+          <span class="nb-color-opt" data-color="#8b5cf6" style="background:#8b5cf6" title="Violeta"></span>
+          <span class="nb-color-opt" data-color="#14b8a6" style="background:#14b8a6" title="Teal"></span>
+        </div>
+        <input id="nb-color-val" type="hidden" value="#6366f1">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:4px">BRIEF / DESCRIPCIÓN <span style="font-weight:400">(para que la IA genere contenido)</span></label>
+        <textarea id="nb-brief" rows="5" placeholder="Describí la marca: qué hace, a quién le habla, tono, pilares de contenido, hashtags, web..." style="width:100%;padding:8px;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;resize:vertical;font-family:inherit"></textarea>
+      </div>
+      <div id="nb-status" style="font-size:12px;color:#64748b;min-height:16px;text-align:center"></div>
+      <button id="nb-submit" onclick="createBrand()" style="background:#1e293b;color:white;border:none;padding:10px 0;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Crear marca</button>
+    </div>
+  </div>
+</div>
 
 <!-- Modal Generación IA -->
 <div class="overlay hidden" id="gen-overlay" onclick="if(event.target===this)closeGenModal()">
@@ -3031,12 +3107,37 @@ textarea{min-height:90px;resize:vertical}
 </div>
 <script>
 const KEY=new URLSearchParams(location.search).get(\'key\')||\'\';
-const BC={EBDS:\'#1e3a8a\',Sibila:\'#7c3aed\',ZoWeAre:\'#059669\',Tivenos:\'#dc2626\',BHU:\'#d97706\'};
+// BC se carga dinámicamente desde /calendar/brands; defaults como fallback
+let BC={EBDS:\'#1e3a8a\',Sibila:\'#7c3aed\',ZoWeAre:\'#059669\',Tivenos:\'#dc2626\',BHU:\'#d97706\'};
 const TC={Reel:\'#16a34a\',Carrusel:\'#9333ea\',Post:\'#2563eb\',LinkedIn:\'#0284c7\',Blog:\'#ea580c\',Email:\'#dc2626\'};
 const TI={Reel:\'\\uD83C\\uDFA5\',Carrusel:\'\\uD83D\\uDCF1\',Post:\'\\uD83D\\uDCDD\',LinkedIn:\'\\uD83D\\uDCBC\',Blog:\'\\uD83D\\uDCC4\',Email:\'\\u2709\\uFE0F\'};
 const SC={pendiente:\'#f59e0b\',aprobado:\'#22c55e\',con_cambios:\'#ef4444\'};
 const MN=[\'Enero\',\'Febrero\',\'Marzo\',\'Abril\',\'Mayo\',\'Junio\',\'Julio\',\'Agosto\',\'Septiembre\',\'Octubre\',\'Noviembre\',\'Diciembre\'];
 let curMonth=\'\',data={},active=\'all\',curPost=null;
+
+async function loadBrandsConfig(){
+  try{
+    const r=await fetch(\'/calendar/brands?key=\'+KEY);
+    const d=await r.json();
+    if(d.ok&&d.brands){
+      Object.entries(d.brands).forEach(([b,v])=>BC[b]=v.color);
+      // Actualizar select del modal Generar con marcas nuevas
+      rebuildGenSelect(Object.keys(d.brands));
+    }
+  }catch(e){console.warn(\'loadBrandsConfig:\',e);}
+}
+
+function rebuildGenSelect(brands){
+  const sel=document.getElementById(\'gen-brand\');
+  if(!sel)return;
+  const cur=sel.value;
+  sel.innerHTML=\'<option value="">— Seleccioná —</option>\';
+  brands.forEach(b=>{
+    const o=document.createElement(\'option\');o.value=b;o.textContent=b;
+    sel.appendChild(o);
+  });
+  if(cur)sel.value=cur;
+}
 const urlM=new URLSearchParams(location.search).get(\'month\');
 const n=new Date();
 curMonth=urlM||(n.getFullYear()+\'-\'+String(n.getMonth()+1).padStart(2,\'0\'));
@@ -3427,7 +3528,77 @@ function changeMonth(d,autoAdvance){
 
 function esc(s){return String(s).replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\').replace(/"/g,\'&quot;\').replace(/\'/g,\'&#39;\');}
 
-if(document.readyState===\'loading\'){document.addEventListener(\'DOMContentLoaded\',load);}else{load();}
+if(document.readyState===\'loading\'){
+  document.addEventListener(\'DOMContentLoaded\',()=>{loadBrandsConfig();load();});
+}else{
+  loadBrandsConfig();load();
+}
+
+// ===== MODAL NUEVA MARCA =====
+let nbSelectedColor=\'#6366f1\';
+
+function openNewBrand(){
+  document.getElementById(\'nb-name\').value=\'\';
+  document.getElementById(\'nb-brief\').value=\'\';
+  document.getElementById(\'nb-status\').textContent=\'\';
+  document.getElementById(\'nb-submit\').disabled=false;
+  document.getElementById(\'nb-submit\').textContent=\'Crear marca\';
+  // Seleccionar primer color por defecto
+  document.querySelectorAll(\'.nb-color-opt\').forEach((el,i)=>{
+    el.classList.toggle(\'selected\',i===0);
+    el.onclick=()=>{
+      document.querySelectorAll(\'.nb-color-opt\').forEach(x=>x.classList.remove(\'selected\'));
+      el.classList.add(\'selected\');
+      nbSelectedColor=el.dataset.color;
+      document.getElementById(\'nb-color-val\').value=nbSelectedColor;
+    };
+  });
+  nbSelectedColor=\'#6366f1\';
+  document.getElementById(\'newbrand-overlay\').classList.remove(\'hidden\');
+  setTimeout(()=>document.getElementById(\'nb-name\').focus(),100);
+}
+
+function closeNewBrand(){
+  document.getElementById(\'newbrand-overlay\').classList.add(\'hidden\');
+}
+
+async function createBrand(){
+  const name=document.getElementById(\'nb-name\').value.trim();
+  const color=document.getElementById(\'nb-color-val\').value||nbSelectedColor;
+  const brief=document.getElementById(\'nb-brief\').value.trim();
+  const status=document.getElementById(\'nb-status\');
+  const btn=document.getElementById(\'nb-submit\');
+
+  if(!name){alert(\'Ingresá el nombre de la marca\');return;}
+
+  btn.disabled=true;btn.textContent=\'Creando...\';
+  status.style.color=\'#64748b\';status.textContent=\'Creando tarea en ClickUp...\';
+
+  try{
+    const r=await fetch(\'/calendar/brands?key=\'+KEY,{
+      method:\'POST\',
+      headers:{\'Content-Type\':\'application/json\'},
+      body:JSON.stringify({name,color,brief})
+    });
+    const d=await r.json();
+    if(d.ok){
+      BC[name]=color;
+      status.style.color=\'#16a34a\';
+      status.textContent=\'✅ Marca "\'+(name)+\'" creada. Recargando...\';
+      // Agregar al select de Generar
+      const sel=document.getElementById(\'gen-brand\');
+      if(sel){const o=document.createElement(\'option\');o.value=name;o.textContent=name;sel.appendChild(o);}
+      setTimeout(()=>{closeNewBrand();load();},800);
+    } else {
+      status.style.color=\'#ef4444\';
+      status.textContent=\'❌ \'+(d.error||\'Error\');
+      btn.disabled=false;btn.textContent=\'Crear marca\';
+    }
+  }catch(e){
+    status.style.color=\'#ef4444\';status.textContent=\'❌ Error de red: \'+e.message;
+    btn.disabled=false;btn.textContent=\'Crear marca\';
+  }
+}
 
 // ===== MODAL GENERACIÓN IA =====
 function openGenModal(){
@@ -3819,8 +3990,15 @@ def calendar_generate_web():
 
     if not brand or not month_str:
         return jsonify({'ok': False, 'error': 'brand y month son requeridos'}), 400
+    # Aceptar marcas hardcodeadas O dinámicas (cargadas desde ClickUp)
     if brand not in CALENDAR_BRAND_TASKS:
-        return jsonify({'ok': False, 'error': f'Marca desconocida: {brand}'}), 400
+        cfg = get_brands_config()
+        if brand not in cfg:
+            return jsonify({'ok': False, 'error': f'Marca desconocida: {brand}'}), 400
+        # Registrar en runtime para esta sesión
+        CALENDAR_BRAND_TASKS[brand] = cfg[brand]['task_id']
+        if cfg[brand].get('brief'):
+            BRAND_CONTEXT[brand] = cfg[brand]['brief']
 
     try:
         year, mo  = int(month_str[:4]), int(month_str[5:])
@@ -3881,6 +4059,66 @@ def calendar_generate_web():
     except Exception as e:
         print(f'generate-web error: {e}')
         return jsonify({'ok': False, 'error': str(e[:200])}), 500
+
+
+@app.route('/calendar/brands', methods=['GET'])
+def calendar_brands_get():
+    """Devuelve la config de todas las marcas (nombre, color). Usado por el frontend."""
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return jsonify({'ok': False, 'error': 'Unauthorized'}), 401
+    cfg = get_brands_config()
+    # Devolver solo nombre + color (sin brief, para no exponer texto innecesariamente)
+    return jsonify({'ok': True, 'brands': {k: {'color': v.get('color', '#666')} for k, v in cfg.items()}})
+
+
+@app.route('/calendar/brands', methods=['POST'])
+def calendar_brands_post():
+    """Crea una nueva marca. Body: {name, color, brief}"""
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return jsonify({'ok': False, 'error': 'Unauthorized'}), 401
+
+    body  = request.get_json(force=True) or {}
+    name  = (body.get('name') or '').strip()
+    color = (body.get('color') or '#6366f1').strip()
+    brief = (body.get('brief') or '').strip()
+
+    if not name:
+        return jsonify({'ok': False, 'error': 'El nombre de la marca es requerido'}), 400
+    if len(name) > 30:
+        return jsonify({'ok': False, 'error': 'El nombre no puede superar 30 caracteres'}), 400
+
+    cfg = get_brands_config()
+    if name in cfg:
+        return jsonify({'ok': False, 'error': f'La marca "{name}" ya existe'}), 409
+
+    # Crear tarea ClickUp para el calendario de esta marca
+    CALENDAR_LIST_ID = '901326439751'
+    try:
+        res = cu_post(f'list/{CALENDAR_LIST_ID}/task', {
+            'name': f'📅 Cal-{name} [NO BORRAR]',
+            'description': 'Calendario generado automáticamente.',
+        })
+        task_id = res.get('id') or res.get('task_id', '')
+    except Exception as e:
+        print(f'brands_post create task: {e}')
+        return jsonify({'ok': False, 'error': f'Error creando tarea ClickUp: {str(e)[:100]}'}), 500
+
+    if not task_id:
+        return jsonify({'ok': False, 'error': 'No se pudo crear la tarea de ClickUp'}), 500
+
+    # Guardar en CALENDAR_BRAND_TASKS runtime (para esta sesión) y en config
+    CALENDAR_BRAND_TASKS[name] = task_id
+    if brief:
+        BRAND_CONTEXT[name] = brief
+    cfg[name] = {'color': color, 'task_id': task_id, 'brief': brief}
+    try:
+        save_brands_config(cfg)
+    except Exception as e:
+        print(f'brands_post save config: {e}')
+
+    return jsonify({'ok': True, 'brand': name, 'color': color, 'task_id': task_id})
 
 
 @app.route('/cron/seo-report', methods=['GET', 'POST'])
