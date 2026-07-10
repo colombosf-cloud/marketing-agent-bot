@@ -2937,6 +2937,9 @@ textarea{min-height:90px;resize:vertical}
 .btn-regen:hover{opacity:1;background:#f0fdf4}
 .btn-del{background:none;border:none;cursor:pointer;font-size:11px;padding:1px 3px;border-radius:4px;opacity:.45;color:#dc2626;transition:opacity .2s,background .2s;line-height:1;flex-shrink:0}
 .btn-del:hover{opacity:1;background:#fee2e2}
+.btn-check{background:none;border:1px solid #cbd5e1;cursor:pointer;font-size:9px;padding:1px 3px;border-radius:3px;color:#94a3b8;font-weight:700;line-height:1;flex-shrink:0;transition:all .15s}
+.btn-check:hover{border-color:#22c55e;color:#22c55e;background:#f0fdf4}
+.btn-check.checked{background:#dcfce7;border-color:#22c55e;color:#16a34a}
 .btn-delete{background:#fee2e2;color:#dc2626;border:none;padding:10px 16px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:background .2s;margin-left:auto}
 .btn-delete:hover{background:#fecaca}
 .regen-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1001;align-items:center;justify-content:center}
@@ -3113,7 +3116,7 @@ const TC={Reel:\'#16a34a\',Carrusel:\'#9333ea\',Post:\'#2563eb\',LinkedIn:\'#028
 const TI={Reel:\'\\uD83C\\uDFA5\',Carrusel:\'\\uD83D\\uDCF1\',Post:\'\\uD83D\\uDCDD\',LinkedIn:\'\\uD83D\\uDCBC\',Blog:\'\\uD83D\\uDCC4\',Email:\'\\u2709\\uFE0F\'};
 const SC={pendiente:\'#f59e0b\',aprobado:\'#22c55e\',con_cambios:\'#ef4444\'};
 const MN=[\'Enero\',\'Febrero\',\'Marzo\',\'Abril\',\'Mayo\',\'Junio\',\'Julio\',\'Agosto\',\'Septiembre\',\'Octubre\',\'Noviembre\',\'Diciembre\'];
-let curMonth=\'\',data={},active=\'all\',curPost=null;
+let curMonth=\'\',data={},active=\'all\',curPost=null,designerChecks=new Set();
 
 async function loadBrandsConfig(){
   try{
@@ -3147,6 +3150,7 @@ async function load(autoAdvance){
     const r=await fetch(\'/calendar/data?key=\'+KEY+\'&month=\'+curMonth);
     const d=await r.json();
     data=d.posts||{};
+    designerChecks=new Set(d.designer_checks||[]);
     const total=Object.values(data).reduce((s,a)=>s+(Array.isArray(a)?a.length:0),0);
     // Si no hay datos y no se especificó mes en la URL, avanzar automáticamente al siguiente mes (una sola vez)
     if(total===0&&!autoAdvance&&!new URLSearchParams(location.search).get(\'month\')){
@@ -3277,13 +3281,27 @@ function mkChip(p){
   chip.style.background=tc+\'18\';chip.style.borderColor=tc+\'30\';
   const icon=TI[p.type]||\'\';
   const cpKey=\'pRef_\'+p.id.replace(/[^a-z0-9]/gi,\'_\');window[cpKey]={...p};
+  const chk=designerChecks.has(p.id);
   chip.innerHTML=\'<div class="chip-dot" style="background:\'+bc+\'"></div>\'
     +\'<span class="chip-title">\'+(p.titulo||p.type)+\'</span>\'
     +\'<span class="chip-icon">\'+icon+\'</span>\'
+    +\'<button class="btn-check\'+(chk?\' checked\':\'\')+\'" title="\'+(chk?\'Diseño listo ✓\':\'Marcar diseño como listo\')+\'">\'+(chk?\'✓\':\'○\')+\'</button>\'
     +\'<button class="btn-regen" style="font-size:11px;padding:1px 3px" title="Regenerar" onclick="openRegen(\'+cpKey+\',event)">🔄</button>\'
     +\'<button class="btn-del" title="Borrar" onclick="confirmDeleteChip(\'+cpKey+\',event)">✕</button>\'
     +\'<div class="chip-status" style="background:\'+(SC[p.status]||\'#94a3b8\')+\'"></div>\';
+  const checkBtn=chip.querySelector(\'.btn-check\');
+  if(checkBtn){checkBtn.addEventListener(\'click\',function(evt){toggleCheck(p.id,evt);});}
   chip.onclick=()=>openPost(p);return chip;
+}
+
+async function toggleCheck(postId,evt){
+  evt.stopPropagation();
+  try{
+    const r=await fetch(\'/calendar/check-toggle?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({post_id:postId})});
+    const d=await r.json();
+    if(d.checked){designerChecks.add(postId);}else{designerChecks.delete(postId);}
+    renderCal();renderAgenda();renderExtras();
+  }catch(e){console.error(e);}
 }
 
 function renderExtras(){
@@ -4141,14 +4159,21 @@ def calendar_page():
     # Si no hay ?month= en la URL, detectar el mes con datos más próximo y redirigir
     if not request.args.get('month'):
         from flask import redirect
-        state = read_state()
-        cal = state.get('calendar', {})
         today = dt.date.today()
-        # Buscar en los próximos 6 meses
+        # Leer una vez por marca (5 llamadas) en lugar de buscar en el estado del bot
+        months_with_data = set()
+        for brand in CALENDAR_BRAND_TASKS:
+            try:
+                brand_data = read_calendar_brand(brand)  # {month_str: [posts]}
+                for ms, posts in brand_data.items():
+                    if posts:
+                        months_with_data.add(ms)
+            except Exception:
+                pass
         for delta in range(0, 7):
             d = today.replace(day=1) + dt.timedelta(days=32 * delta)
             ms = f'{d.year}-{str(d.month).zfill(2)}'
-            if ms in cal and any(cal[ms].get(b) for b in CALENDAR_BRANDS):
+            if ms in months_with_data:
                 return redirect(f'/calendar?key={key}&month={ms}')
     return Response(CALENDAR_HTML, mimetype='text/html')
 
@@ -4160,7 +4185,9 @@ def calendar_data_route():
     month_str = request.args.get('month', dt.date.today().strftime('%Y-%m'))
     month_data = get_calendar_data(month_str)
     brands = [b for b in CALENDAR_BRANDS if b in month_data]
-    return Response(json.dumps({'posts': month_data, 'brands': brands}, ensure_ascii=False), mimetype='application/json')
+    state = read_state()
+    designer_checks = state.get('designer_checks', [])
+    return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks}, ensure_ascii=False), mimetype='application/json')
 
 @app.route('/calendar/save', methods=['POST'])
 def calendar_save_route():
@@ -4186,6 +4213,29 @@ def calendar_save_route():
         posts_list.append(post)
     save_calendar_brand(brand, month_str, posts_list)
     return Response('OK', status=200)
+
+@app.route('/calendar/check-toggle', methods=['POST'])
+def calendar_check_toggle():
+    """Activa/desactiva el check de diseñadora para un post. Guarda en el estado del bot."""
+    key = request.args.get('key', '')
+    if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
+        return Response('Unauthorized', status=401)
+    body = request.get_json() or {}
+    post_id = body.get('post_id')
+    if not post_id:
+        return Response('Bad request', status=400)
+    state = read_state()
+    checks = state.get('designer_checks', [])
+    if post_id in checks:
+        checks.remove(post_id)
+        checked = False
+    else:
+        checks.append(post_id)
+        checked = True
+    state['designer_checks'] = checks
+    save_state(state)
+    return Response(json.dumps({'ok': True, 'post_id': post_id, 'checked': checked}),
+                    mimetype='application/json')
 
 @app.route('/calendar/replace-brand', methods=['POST'])
 def calendar_replace_brand_route():
