@@ -675,6 +675,8 @@ def h_crm_report(text, state):
     total_en_pipeline = f['contactados'] + f['interesados'] + f['evaluando'] + f['promesa_pago'] + f['estudiantes']
     conv_rate = round(f['estudiantes'] / total_en_pipeline * 100, 1) if total_en_pipeline else 0
 
+    _meta_ads_section = ('META ADS — conjuntos activos últimos 30d (nivel adset):\n' + json.dumps([{"adset": c.get("adset_name",""), "campaign": c.get("campaign_name",""), "spend": c.get("spend",0), "leads": sum(int(a.get("value",0)) for a in (c.get("actions") or []) if a.get("action_type") == "onsite_conversion.lead_grouped"), "ctr": c.get("ctr",0)} for c in meta_data[:15]], ensure_ascii=False)) if meta_data else 'Meta Ads: sin datos'
+
     prompt = f"""Generá un reporte de CRM para {client_name} en español neutro para Telegram (Markdown).
 
 FUNNEL COMPLETO:
@@ -693,7 +695,7 @@ TOP PROGRAMAS (en pipeline activo):
 FUENTES DE LEADS:
 {json.dumps(funnel['leads_por_fuente'], ensure_ascii=False)}
 
-{('META ADS — conjuntos activos últimos 30d (nivel adset):\n' + json.dumps([{"adset": c.get("adset_name",""), "campaign": c.get("campaign_name",""), "spend": c.get("spend",0), "leads": sum(int(a.get("value",0)) for a in (c.get("actions") or []) if a.get("action_type") == "onsite_conversion.lead_grouped"), "ctr": c.get("ctr",0)} for c in meta_data[:15]], ensure_ascii=False)) if meta_data else 'Meta Ads: sin datos'}
+{_meta_ads_section}
 
 Formato para Telegram con Markdown:
 📊 *{client_name} — CRM + Meta Ads*
@@ -5066,7 +5068,7 @@ footer{{background:var(--white);border-top:1px solid var(--border);padding:24px 
 <!-- 02 META ADS -->
 <section class="sec" id="meta">
 <div class="sh"><span class="sn">02</span><h2 class="st">Meta Ads — Prospecting</h2><span class="sb">Nivel adset</span></div>
-{'<div class="al al-amber">Sin datos de Meta Ads para el per\xedodo seleccionado.</div>' if not meta_data else ''}
+{'<div class="al al-amber">Sin datos de Meta Ads para el período seleccionado.</div>' if not meta_data else ''}
 <div class="tw">
 <table class="tbl">
 <colgroup>
