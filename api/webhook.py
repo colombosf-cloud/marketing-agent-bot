@@ -3502,7 +3502,7 @@ function openRegen(p,e){
   document.getElementById(\'regen-overlay\').classList.add(\'show\');
 }
 function closeRegen(){document.getElementById(\'regen-overlay\').classList.remove(\'show\');}
-document.getElementById(\'regen-overlay\').onclick=e=>{if(e.target.id===\'regen-overlay\')closeRegen();};
+document.addEventListener(\'click\',function(e){if(e.target.id===\'regen-overlay\')closeRegen();});
 
 async function doRegen(){
   if(!regenPost)return;
