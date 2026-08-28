@@ -1549,7 +1549,7 @@ CALENDAR_BRAND_COLORS = {
     'Tivenos': '#dc2626', 'BHU': '#d97706',
 }
 CALENDAR_TYPE_COLORS = {
-    'Reel': '#16a34a', 'Carrusel': '#9333ea', 'Post': '#2563eb',
+    'Reel': '#16a34a', 'Carrusel': '#9333ea', 'Post': '#2563eb', 'Story': '#db2777',
     'LinkedIn': '#0284c7', 'Blog': '#ea580c', 'Email': '#dc2626',
 }
 
@@ -2535,8 +2535,9 @@ REGLAS DE FORMATO texto_imagen:
 - Carrusel (mínimo 5 slides): "S1: [tema de apertura]\\nS2: [punto clave → beneficio concreto]\\nS3: [punto clave → beneficio concreto]\\nS4: [punto clave → beneficio concreto]\\nS5: [punto clave → beneficio concreto]\\nS6: [CTA + web de la marca]" — cada slide tiene texto corto, impactante
 - Reel (guion completo, NO dejar incompleto):
   "Gancho (0-3s): [descripción exacta de la escena de apertura — qué se ve en pantalla]\\nEscena 1 (3-10s): [qué se muestra/hace]\\nEscena 2 (10-20s): [qué se muestra/hace]\\nEscena 3 (20-28s): [qué se muestra/hace]\\nNarración completa: \\'[guion hablado completo de 40-60 palabras, español neutro]\'\\nTexto superpuesto: \\'[frase clave que aparece en pantalla]\'\\nCTA final (28-35s): \\'[texto del CTA visible en pantalla + acción concreta]\'"
+- Story (1 sola placa vertical, formato efímero — más directo e informal que un Post): "[Frase corta tipo pregunta o dato, máx 10 palabras]\\nSticker: [encuesta/quiz/deslizador o \\'Link en bio\\' si aplica]\\n(logo [MARCA])"
 
-REGLAS DE COPY: máx 120 palabras, tono directo y aspiracional, usa → para listar beneficios, 1-2 emojis por bloque, siempre terminar con CTA al link de la bio y 3-5 hashtags.
+REGLAS DE COPY: máx 120 palabras, tono directo y aspiracional, usa → para listar beneficios, 1-2 emojis por bloque, siempre terminar con CTA al link de la bio y 3-5 hashtags. Para Story el copy es opcional y breve (máx 20 palabras) — la placa es autoexplicativa.
 Sin saltos de línea literales en el JSON (usar \\n dentro del string).
 """
 
@@ -2796,7 +2797,7 @@ def h_regen_post(text, state):
     target_day = int(day_match.group(1)) if day_match else None
 
     # Type filter
-    type_map = {'reel':'Reel','carrusel':'Carrusel','post':'Post','linkedin':'LinkedIn','blog':'Blog','email':'Email'}
+    type_map = {'reel':'Reel','carrusel':'Carrusel','post':'Post','story':'Story','linkedin':'LinkedIn','blog':'Blog','email':'Email'}
     type_filter = next((v for k,v in type_map.items() if k in t), None)
 
     # Instruction (text after "que sea", "con enfoque", "sobre", "estilo", "hablando de", etc.)
@@ -3133,6 +3134,7 @@ textarea{min-height:90px;resize:vertical}
     <div class="legend-item"><div class="legend-dot" style="background:#16a34a"></div>Reel</div>
     <div class="legend-item"><div class="legend-dot" style="background:#9333ea"></div>Carrusel</div>
     <div class="legend-item"><div class="legend-dot" style="background:#2563eb"></div>Post</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#db2777"></div>Story</div>
     <div class="legend-item"><div class="legend-dot" style="background:#0284c7"></div>LinkedIn</div>
     <div class="legend-item"><div class="legend-dot" style="background:#ea580c"></div>Blog</div>
     <div class="legend-item"><div class="legend-dot" style="background:#dc2626"></div>Email</div>
@@ -3164,8 +3166,8 @@ textarea{min-height:90px;resize:vertical}
 const KEY=new URLSearchParams(location.search).get(\'key\')||\'\';
 // BC se carga dinámicamente desde /calendar/brands; defaults como fallback
 let BC={EBDS:\'#1e3a8a\',Sibila:\'#7c3aed\',ZoWeAre:\'#059669\',Tivenos:\'#dc2626\',BHU:\'#d97706\'};
-const TC={Reel:\'#16a34a\',Carrusel:\'#9333ea\',Post:\'#2563eb\',LinkedIn:\'#0284c7\',Blog:\'#ea580c\',Email:\'#dc2626\'};
-const TI={Reel:\'\\uD83C\\uDFA5\',Carrusel:\'\\uD83D\\uDCF1\',Post:\'\\uD83D\\uDCDD\',LinkedIn:\'\\uD83D\\uDCBC\',Blog:\'\\uD83D\\uDCC4\',Email:\'\\u2709\\uFE0F\'};
+const TC={Reel:\'#16a34a\',Carrusel:\'#9333ea\',Post:\'#2563eb\',Story:\'#db2777\',LinkedIn:\'#0284c7\',Blog:\'#ea580c\',Email:\'#dc2626\'};
+const TI={Reel:\'\\uD83C\\uDFA5\',Carrusel:\'\\uD83D\\uDCF1\',Post:\'\\uD83D\\uDCDD\',Story:\'\\uD83D\\uDCF8\',LinkedIn:\'\\uD83D\\uDCBC\',Blog:\'\\uD83D\\uDCC4\',Email:\'\\u2709\\uFE0F\'};
 const SC={pendiente:\'#f59e0b\',aprobado:\'#22c55e\',con_cambios:\'#ef4444\'};
 const MN=[\'Enero\',\'Febrero\',\'Marzo\',\'Abril\',\'Mayo\',\'Junio\',\'Julio\',\'Agosto\',\'Septiembre\',\'Octubre\',\'Noviembre\',\'Diciembre\'];
 let curMonth=\'\',data={},active=\'all\',curPost=null,designerChecks=new Set();
@@ -3438,8 +3440,8 @@ function openPost(p){
     \'<span style="color:\'+bc2+\'">\'+p.brand+\'</span> &middot; \'
     +\'<span style="color:\'+tc+\'">\'+( TI[p.type]||\'\')+\' \'+p.type+\'</span>\'
     +(p.date?\' &middot; <span style="color:#94a3b8">\'+p.date+\'</span>\':\'\'  );
-  const typeOpts=[\'Reel\',\'Post\',\'Carrusel\',\'LinkedIn\',\'Blog\',\'Email\'];
-  const typeIcons={Reel:\'🎥\',Post:\'📝\',Carrusel:\'📱\',LinkedIn:\'💼\',Blog:\'📄\',Email:\'✉️\'};
+  const typeOpts=[\'Reel\',\'Post\',\'Carrusel\',\'Story\',\'LinkedIn\',\'Blog\',\'Email\'];
+  const typeIcons={Reel:\'🎥\',Post:\'📝\',Carrusel:\'📱\',Story:\'📸\',LinkedIn:\'💼\',Blog:\'📄\',Email:\'✉️\'};
   const typeSelectOpts=typeOpts.map(t=>\'<option value="\'+t+\'"\'+(p.type===t?\' selected\':\'\')+\'>\'+( typeIcons[t]||\'\')+\' \'+t+\'</option>\').join(\'\');
   document.getElementById(\'modal-body\').innerHTML=
     \'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">\'
@@ -3475,7 +3477,7 @@ function updateModalHeader(){
   if(!curPost)return;
   const t=document.getElementById(\'e-type\');
   if(!t)return;
-  const typeIcons2={Reel:\'🎥\',Post:\'📝\',Carrusel:\'📱\',LinkedIn:\'💼\',Blog:\'📄\',Email:\'✉️\'};
+  const typeIcons2={Reel:\'🎥\',Post:\'📝\',Carrusel:\'📱\',Story:\'📸\',LinkedIn:\'💼\',Blog:\'📄\',Email:\'✉️\'};
   const bc2=BC[curPost.brand]||\'#666\';const tc2=TC[t.value]||\'#666\';
   document.getElementById(\'modal-title\').innerHTML=
     \'<span style="color:\'+bc2+\'">\'+curPost.brand+\'</span> &middot; \'
@@ -4312,7 +4314,7 @@ def calendar_replace_brand_route():
     if not month_str or not brand:
         return Response('Bad request — se requiere month y brand', status=400)
     # Compactar: texto_imagen conservado en sociales (cap 200), omitido en LI/Blog/Email
-    SOCIAL_TYPES = {'Post', 'Carrusel', 'Reel'}
+    SOCIAL_TYPES = {'Post', 'Carrusel', 'Reel', 'Story'}
     COPY_LIMITS  = {'Blog': 400, 'Email': 400, 'LinkedIn': 400}
     compact_posts = []
     for p in new_posts:
