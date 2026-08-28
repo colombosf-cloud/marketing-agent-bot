@@ -3,7 +3,7 @@ import urllib.request, urllib.error, urllib.parse
 from datetime import datetime
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 
 app = Flask(__name__)
 
@@ -2588,17 +2588,20 @@ texto_imagen: "Gancho (0-3s): [escena de apertura visual impactante]\\nEscena 1 
 }
 
 def generate_social_posts(brand, month_label, slots):
-    """Genera social posts en batches de 4 para no exceder tokens."""
+    """Genera social posts en batches de 4 (límite de tokens por request a Claude).
+    Los batches se disparan en PARALELO — antes eran secuenciales y para un mes con
+    ~13 slots (4 batches) la suma de latencias superaba fácil los 29s de abort del
+    frontend / el timeout de la función serverless. En paralelo el tiempo total
+    queda acotado por el batch más lento, no por la suma de todos."""
     if not slots:
         return []
     context = BRAND_CONTEXT.get(brand, brand)
     days_es = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo']
     examples = BRAND_STYLE_EXAMPLES.get(brand, BRAND_STYLE_EXAMPLES['_generic'])
-
-    all_posts = []
     batch_size = 4
-    for i in range(0, len(slots), batch_size):
-        batch = slots[i:i+batch_size]
+    batches = [slots[i:i+batch_size] for i in range(0, len(slots), batch_size)]
+
+    def gen_one(batch):
         slots_info = [{'date': s[0].isoformat() if hasattr(s[0],'isoformat') else s[0],
                        'day': days_es[dt.date.fromisoformat(str(s[0])).weekday()],
                        'type': s[1]} for s in batch]
@@ -2615,27 +2618,36 @@ IMPORTANTE: Los Reels deben tener el guion COMPLETO — todas las escenas, la na
 
 SOLO JSON array, sin texto extra antes ni después:
 [{{"date":"YYYY-MM-DD","day":"Dia","type":"Reel/Carrusel/Post","pilar":"categoria","objetivo":"awareness/educacion/conversion","titulo":"max 60 chars","texto_imagen":"estructura visual del contenido COMPLETA","copy":"caption para redes max 120 palabras","hashtags":"#tag1 #tag2 #tag3"}}]"""
-        try:
-            r = claude(prompt, max_tokens=3000)
-            m = re.search(r'\[.*?\]', r, re.DOTALL)
-            if m:
-                batch_posts = json.loads(m.group())
-                if len(batch_posts) != len(slots_info):
-                    print(f'Social gen {brand} batch {i}: esperaba {len(slots_info)} posts, '
-                          f'el modelo devolvió {len(batch_posts)}')
-                for j, p in enumerate(batch_posts):
-                    # Nunca confiar en el date/day/type que "recuerda" el modelo — forzar
-                    # los valores reales calculados por get_posting_dates para que el post
-                    # quede en el día correcto del calendario.
-                    if j < len(slots_info):
-                        p['date'] = slots_info[j]['date']
-                        p['day']  = slots_info[j]['day']
-                        p['type'] = slots_info[j]['type']
-                    p.update({'id': f'{brand.lower()}-{p.get("date",i)}', 'brand': brand,
-                              'status': 'pendiente', 'comments': '', 'networks': ['Instagram','Facebook']})
-                all_posts.extend(batch_posts)
-        except Exception as e:
-            print(f'Social gen {brand} batch {i}: {e}')
+        r = claude(prompt, max_tokens=3000)
+        m = re.search(r'\[.*?\]', r, re.DOTALL)
+        batch_posts = json.loads(m.group()) if m else []
+        if len(batch_posts) != len(slots_info):
+            print(f'Social gen {brand}: esperaba {len(slots_info)} posts, el modelo devolvió {len(batch_posts)}')
+        for j, p in enumerate(batch_posts):
+            # Nunca confiar en el date/day/type que "recuerda" el modelo — forzar
+            # los valores reales calculados por get_posting_dates para que el post
+            # quede en el día correcto del calendario.
+            if j < len(slots_info):
+                p['date'] = slots_info[j]['date']
+                p['day']  = slots_info[j]['day']
+                p['type'] = slots_info[j]['type']
+            p.update({'id': f'{brand.lower()}-{p.get("date", j)}', 'brand': brand,
+                      'status': 'pendiente', 'comments': '', 'networks': ['Instagram','Facebook']})
+        return batch_posts
+
+    results = [[] for _ in batches]
+    with ThreadPoolExecutor(max_workers=min(4, len(batches))) as ex:
+        futures = {ex.submit(gen_one, b): idx for idx, b in enumerate(batches)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as e:
+                print(f'Social gen {brand} batch {idx}: {e}')
+
+    all_posts = []
+    for r in results:
+        all_posts.extend(r)
     return all_posts
 
 def generate_linkedin_posts(brand, month_label, count):
