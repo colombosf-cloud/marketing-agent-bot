@@ -3248,33 +3248,41 @@ function renderCal(){
   const body=document.getElementById(\'cal-body\');
   body.innerHTML=\'\';
   const dates=monthDates();
+  // Agrupar por semana real (lunes de cada semana), no por Math.ceil(dia/7) —
+  // eso rompía el grid cuando el mes no arranca en lunes (ej: si el 1 cae martes,
+  // el lunes 7 quedaba agrupado con el martes 1 en la misma fila).
+  const weekKeys=[];
   const weeks={};
-  dates.forEach(d=>{const wk=Math.ceil(d.getDate()/7);if(!weeks[wk])weeks[wk]={};weeks[wk][d.getDay()]=d;});
-  Object.keys(weeks).sort((a,b)=>a-b).forEach((wk,wi)=>{
+  dates.forEach(d=>{
+    const dow0=d.getDay();
+    const diff=dow0===0?-6:1-dow0;
+    const monDate=new Date(d.getFullYear(),d.getMonth(),d.getDate()+diff);
+    const wk=fmt(monDate);
+    if(!weeks[wk]){weeks[wk]={mon:monDate,days:{}};weekKeys.push(wk);}
+    weeks[wk].days[dow0]=d;
+  });
+  weekKeys.forEach((wk,wi)=>{
     const w=weeks[wk];
     const lbl=document.createElement(\'div\');lbl.className=\'week-lbl\';lbl.textContent=\'S\'+(wi+1);
     body.appendChild(lbl);
     for(let dow=1;dow<=5;dow++){
       const cell=document.createElement(\'div\');cell.className=\'day-cell\';
-      if(w[dow]){
-        const d=w[dow];const ds=fmt(d);
+      if(w.days[dow]){
+        const d=w.days[dow];const ds=fmt(d);
         const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=d.getDate();
         cell.appendChild(dn);
         getForDate(ds).forEach(p=>cell.appendChild(mkChip(p)));
         getExtrasForDate(ds).forEach(p=>cell.appendChild(mkMiniChip(p)));
         const ab=document.createElement(\'div\');ab.className=\'add-btn\';ab.innerHTML=\'+\';ab.title=\'Agregar\';ab.onclick=()=>openNew(ds);cell.appendChild(ab);
       }else{
-        // Celda vacía: calcular qué día sería para mostrar el número
+        // Celda vacía: calcular qué día sería, usando el lunes real de esta semana.
+        // Solo mostrar el número si cae dentro del mes que se está viendo (m) —
+        // los días de relleno del mes anterior/siguiente quedan en blanco.
         cell.className+=\' inactive\';
-        // Buscar el lunes de esta semana y sumar (dow-1) días
-        const monDate=Object.values(w)[0];
-        if(monDate){
-          const dayOffset=dow-monDate.getDay();
-          const emptyDate=new Date(monDate.getTime()+dayOffset*86400000);
-          if(emptyDate.getMonth()===monDate.getMonth()){
-            const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=emptyDate.getDate();
-            cell.appendChild(dn);
-          }
+        const emptyDate=new Date(w.mon.getTime()+(dow-1)*86400000);
+        if(emptyDate.getMonth()===m-1){
+          const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=emptyDate.getDate();
+          cell.appendChild(dn);
         }
       }
       body.appendChild(cell);
