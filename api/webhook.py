@@ -492,8 +492,21 @@ def save_state(state):
     cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': _encode_for_clickup(state)})
 
 def _brand_task(brand):
-    """Devuelve el task_id de ClickUp para una marca. Fallback a la tarea legacy."""
-    return CALENDAR_BRAND_TASKS.get(brand, CALENDAR_TASK_ID)
+    """Devuelve el task_id de ClickUp para una marca.
+    Marcas hardcodeadas → dict en memoria. Marcas creadas dinámicamente → config en ClickUp
+    (necesario porque en un cold start de Vercel CALENDAR_BRAND_TASKS no las tiene).
+    Fallback final: tarea legacy."""
+    if brand in CALENDAR_BRAND_TASKS:
+        return CALENDAR_BRAND_TASKS[brand]
+    try:
+        cfg = get_brands_config()
+        task_id = cfg.get(brand, {}).get('task_id')
+        if task_id:
+            CALENDAR_BRAND_TASKS[brand] = task_id  # cachear para el resto de esta invocación
+            return task_id
+    except Exception as e:
+        print(f'_brand_task config lookup {brand}: {e}')
+    return CALENDAR_TASK_ID
 
 def read_calendar_brand(brand, month_str=None):
     """Lee los posts de UNA marca desde su tarea dedicada. Rápido (~15KB por marca)."""
@@ -528,7 +541,7 @@ def read_calendar():
     """Lee el calendario completo (todas las marcas) para /calendar/data.
     Hace una llamada por marca — se usa solo en carga de página."""
     result = {}
-    for brand in CALENDAR_BRAND_TASKS:
+    for brand in get_all_brand_tasks():
         try:
             data = read_calendar_brand(brand)
             result[brand] = data   # {month_str: [posts]}
@@ -571,6 +584,21 @@ def get_brands_config():
         cfg = dict(_BRANDS_DEFAULT)
         save_brands_config(cfg)
     return cfg
+
+def get_all_brand_tasks():
+    """Devuelve {brand: task_id} combinando las marcas hardcodeadas con las creadas
+    dinámicamente desde la UI (guardadas en ClickUp vía save_brands_config).
+    Usar esto — no CALENDAR_BRAND_TASKS directo — en cualquier lugar que necesite
+    iterar TODAS las marcas, porque CALENDAR_BRAND_TASKS no sobrevive un cold start."""
+    tasks = dict(CALENDAR_BRAND_TASKS)
+    try:
+        cfg = get_brands_config()
+        for name, info in cfg.items():
+            if info.get('task_id'):
+                tasks[name] = info['task_id']
+    except Exception as e:
+        print(f'get_all_brand_tasks: {e}')
+    return tasks
 
 # --- Helpers ---
 def detect_client(text):
@@ -2436,7 +2464,7 @@ def get_calendar_data(month_str=None):
     Devuelve {brand: [posts]} para un mes, o {month: {brand: [posts]}} sin mes."""
     try:
         brands_data = {}
-        for brand in CALENDAR_BRAND_TASKS:
+        for brand in get_all_brand_tasks():
             brand_months = read_calendar_brand(brand)  # {month_str: [posts]}
             if month_str:
                 posts = brand_months.get(month_str, [])
@@ -2592,7 +2620,17 @@ SOLO JSON array, sin texto extra antes ni después:
             m = re.search(r'\[.*?\]', r, re.DOTALL)
             if m:
                 batch_posts = json.loads(m.group())
-                for p in batch_posts:
+                if len(batch_posts) != len(slots_info):
+                    print(f'Social gen {brand} batch {i}: esperaba {len(slots_info)} posts, '
+                          f'el modelo devolvió {len(batch_posts)}')
+                for j, p in enumerate(batch_posts):
+                    # Nunca confiar en el date/day/type que "recuerda" el modelo — forzar
+                    # los valores reales calculados por get_posting_dates para que el post
+                    # quede en el día correcto del calendario.
+                    if j < len(slots_info):
+                        p['date'] = slots_info[j]['date']
+                        p['day']  = slots_info[j]['day']
+                        p['type'] = slots_info[j]['type']
                     p.update({'id': f'{brand.lower()}-{p.get("date",i)}', 'brand': brand,
                               'status': 'pendiente', 'comments': '', 'networks': ['Instagram','Facebook']})
                 all_posts.extend(batch_posts)
@@ -2838,7 +2876,7 @@ def h_calendar(text, state):
 
     brand_keys = {'ebds': 'EBDS', 'sibila': 'Sibila', 'zoweare': 'ZoWeAre', 'tivenos': 'Tivenos', 'bhu': 'BHU', 'behind': 'BHU'}
     if 'todas' in t or 'todo' in t:
-        brands_to_gen = list(CALENDAR_BRANDS)
+        brands_to_gen = list(get_all_brand_tasks())
     else:
         brands_to_gen = list({v for k, v in brand_keys.items() if k in t})
 
@@ -3210,33 +3248,41 @@ function renderCal(){
   const body=document.getElementById(\'cal-body\');
   body.innerHTML=\'\';
   const dates=monthDates();
+  // Agrupar por semana real (lunes de cada semana), no por Math.ceil(dia/7) —
+  // eso rompía el grid cuando el mes no arranca en lunes (ej: si el 1 cae martes,
+  // el lunes 7 quedaba agrupado con el martes 1 en la misma fila).
+  const weekKeys=[];
   const weeks={};
-  dates.forEach(d=>{const wk=Math.ceil(d.getDate()/7);if(!weeks[wk])weeks[wk]={};weeks[wk][d.getDay()]=d;});
-  Object.keys(weeks).sort((a,b)=>a-b).forEach((wk,wi)=>{
+  dates.forEach(d=>{
+    const dow0=d.getDay();
+    const diff=dow0===0?-6:1-dow0;
+    const monDate=new Date(d.getFullYear(),d.getMonth(),d.getDate()+diff);
+    const wk=fmt(monDate);
+    if(!weeks[wk]){weeks[wk]={mon:monDate,days:{}};weekKeys.push(wk);}
+    weeks[wk].days[dow0]=d;
+  });
+  weekKeys.forEach((wk,wi)=>{
     const w=weeks[wk];
     const lbl=document.createElement(\'div\');lbl.className=\'week-lbl\';lbl.textContent=\'S\'+(wi+1);
     body.appendChild(lbl);
     for(let dow=1;dow<=5;dow++){
       const cell=document.createElement(\'div\');cell.className=\'day-cell\';
-      if(w[dow]){
-        const d=w[dow];const ds=fmt(d);
+      if(w.days[dow]){
+        const d=w.days[dow];const ds=fmt(d);
         const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=d.getDate();
         cell.appendChild(dn);
         getForDate(ds).forEach(p=>cell.appendChild(mkChip(p)));
         getExtrasForDate(ds).forEach(p=>cell.appendChild(mkMiniChip(p)));
         const ab=document.createElement(\'div\');ab.className=\'add-btn\';ab.innerHTML=\'+\';ab.title=\'Agregar\';ab.onclick=()=>openNew(ds);cell.appendChild(ab);
       }else{
-        // Celda vacía: calcular qué día sería para mostrar el número
+        // Celda vacía: calcular qué día sería, usando el lunes real de esta semana.
+        // Solo mostrar el número si cae dentro del mes que se está viendo (m) —
+        // los días de relleno del mes anterior/siguiente quedan en blanco.
         cell.className+=\' inactive\';
-        // Buscar el lunes de esta semana y sumar (dow-1) días
-        const monDate=Object.values(w)[0];
-        if(monDate){
-          const dayOffset=dow-monDate.getDay();
-          const emptyDate=new Date(monDate.getTime()+dayOffset*86400000);
-          if(emptyDate.getMonth()===monDate.getMonth()){
-            const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=emptyDate.getDate();
-            cell.appendChild(dn);
-          }
+        const emptyDate=new Date(w.mon.getTime()+(dow-1)*86400000);
+        if(emptyDate.getMonth()===m-1){
+          const dn=document.createElement(\'div\');dn.className=\'day-num\';dn.textContent=emptyDate.getDate();
+          cell.appendChild(dn);
         }
       }
       body.appendChild(cell);
@@ -4078,7 +4124,7 @@ def calendar_generate_web():
 
     except Exception as e:
         print(f'generate-web error: {e}')
-        return jsonify({'ok': False, 'error': str(e[:200])}), 500
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
 @app.route('/calendar/brands', methods=['GET'])
@@ -4164,7 +4210,7 @@ def calendar_page():
         today = dt.date.today()
         # Leer una vez por marca (5 llamadas) en lugar de buscar en el estado del bot
         months_with_data = set()
-        for brand in CALENDAR_BRAND_TASKS:
+        for brand in get_all_brand_tasks():
             try:
                 brand_data = read_calendar_brand(brand)  # {month_str: [posts]}
                 for ms, posts in brand_data.items():
@@ -4186,7 +4232,7 @@ def calendar_data_route():
         return Response('{}', status=401, mimetype='application/json')
     month_str = request.args.get('month', dt.date.today().strftime('%Y-%m'))
     month_data = get_calendar_data(month_str)
-    brands = [b for b in CALENDAR_BRANDS if b in month_data]
+    brands = [b for b in get_all_brand_tasks() if b in month_data]
     state = read_state()
     designer_checks = state.get('designer_checks', [])
     return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks}, ensure_ascii=False), mimetype='application/json')
@@ -4294,7 +4340,7 @@ def calendar_delete_route():
         save_calendar_brand(brand, month_str, posts_list)
     else:
         # sin brand: buscar en todas las marcas
-        for b in CALENDAR_BRAND_TASKS:
+        for b in get_all_brand_tasks():
             posts_list = read_calendar_brand(b, month_str)
             filtered = [p for p in posts_list if p.get('id') != post_id]
             if len(filtered) < len(posts_list):
@@ -4337,7 +4383,7 @@ def calendar_regenerate_post_route():
         return Response('Bad request', status=400)
     # Buscar el post en las tareas de las marcas
     found_post = None; found_brand = None
-    for b in CALENDAR_BRAND_TASKS:
+    for b in get_all_brand_tasks():
         posts_list = read_calendar_brand(b, month_str)
         for p in posts_list:
             if p.get('id') == post_id:
