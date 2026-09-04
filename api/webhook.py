@@ -3513,7 +3513,9 @@ async function savePost(){
       setTimeout(()=>{closeModal();renderCal();renderAgenda();renderExtras();},350);
     }else{
       if(btn){btn.disabled=false;btn.style.opacity=\'1\';btn.innerHTML=orig;}
-      alert(\'Error al guardar. Intentá de nuevo.\');
+      let msg=\'Error al guardar. Intentá de nuevo.\';
+      try{const j=await r.json();if(j&&j.error)msg=\'Error al guardar: \'+j.error;}catch(_e){}
+      alert(msg);
     }
   }catch(e){
     if(btn){btn.disabled=false;btn.style.opacity=\'1\';btn.innerHTML=orig;}
@@ -3530,8 +3532,12 @@ async function deletePost(){
     if(r.ok){
       if(data[curPost.brand])data[curPost.brand]=data[curPost.brand].filter(x=>x.id!==curPost.id);
       closeModal();renderCal();renderAgenda();renderExtras();
-    }else{alert(\'Error al borrar\');}
-  }catch(e){alert(\'Error al borrar\');}
+    }else{
+      let msg=\'Error al borrar\';
+      try{const j=await r.json();if(j&&j.error)msg=\'Error al borrar: \'+j.error;}catch(_e){}
+      alert(msg);
+    }
+  }catch(e){alert(\'Error de conexión al borrar\');}
 }
 
 async function confirmDeleteChip(p,e){
@@ -3542,8 +3548,12 @@ async function confirmDeleteChip(p,e){
     if(r.ok){
       if(data[p.brand])data[p.brand]=data[p.brand].filter(x=>x.id!==p.id);
       renderCal();renderAgenda();renderExtras();
+    }else{
+      let msg=\'Error al borrar\';
+      try{const j=await r.json();if(j&&j.error)msg=\'Error al borrar: \'+j.error;}catch(_e){}
+      alert(msg);
     }
-  }catch(e){alert(\'Error al borrar\');}
+  }catch(e){alert(\'Error de conexión al borrar\');}
 }
 
 function closeModal(){document.getElementById(\'overlay\').classList.add(\'hidden\');}
@@ -4265,15 +4275,20 @@ def calendar_save_route():
     brand = post.get('brand', '')
     if not brand:
         return Response('Bad request — falta brand en el post', status=400)
-    # Leer y escribir SOLO la tarea de esa marca (payload ~15KB en lugar de 107KB)
-    brand_data = read_calendar_brand(brand)      # {month_str: [posts]}
-    posts_list = brand_data.get(month_str, [])
-    idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
-    if idx >= 0:
-        posts_list[idx] = post
-    else:
-        posts_list.append(post)
-    save_calendar_brand(brand, month_str, posts_list)
+    try:
+        # Leer y escribir SOLO la tarea de esa marca (payload ~15KB en lugar de 107KB)
+        brand_data = read_calendar_brand(brand)      # {month_str: [posts]}
+        posts_list = brand_data.get(month_str, [])
+        idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
+        if idx >= 0:
+            posts_list[idx] = post
+        else:
+            posts_list.append(post)
+        save_calendar_brand(brand, month_str, posts_list)
+    except Exception as e:
+        print(f'calendar_save_route error: {e}')
+        return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
+                        status=500, mimetype='application/json')
     return Response('OK', status=200)
 
 @app.route('/calendar/check-toggle', methods=['POST'])
@@ -4286,16 +4301,21 @@ def calendar_check_toggle():
     post_id = body.get('post_id')
     if not post_id:
         return Response('Bad request', status=400)
-    state = read_state()
-    checks = state.get('designer_checks', [])
-    if post_id in checks:
-        checks.remove(post_id)
-        checked = False
-    else:
-        checks.append(post_id)
-        checked = True
-    state['designer_checks'] = checks
-    save_state(state)
+    try:
+        state = read_state()
+        checks = state.get('designer_checks', [])
+        if post_id in checks:
+            checks.remove(post_id)
+            checked = False
+        else:
+            checks.append(post_id)
+            checked = True
+        state['designer_checks'] = checks
+        save_state(state)
+    except Exception as e:
+        print(f'calendar_check_toggle error: {e}')
+        return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
+                        status=500, mimetype='application/json')
     return Response(json.dumps({'ok': True, 'post_id': post_id, 'checked': checked}),
                     mimetype='application/json')
 
@@ -4330,8 +4350,13 @@ def calendar_replace_brand_route():
         if lim and len(cp.get('copy', '')) > lim:
             cp['copy'] = cp['copy'][:lim]
         compact_posts.append(cp)
-    # Escribir SOLO la tarea de esa marca (~15KB en lugar de 107KB)
-    save_calendar_brand(brand, month_str, compact_posts)
+    try:
+        # Escribir SOLO la tarea de esa marca (~15KB en lugar de 107KB)
+        save_calendar_brand(brand, month_str, compact_posts)
+    except Exception as e:
+        print(f'calendar_replace_brand_route error: {e}')
+        return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
+                        status=500, mimetype='application/json')
     return Response(json.dumps({'ok': True, 'brand': brand, 'month': month_str,
                                 'posts': len(new_posts)}), status=200,
                     mimetype='application/json')
@@ -4348,18 +4373,23 @@ def calendar_delete_route():
     brand     = body.get('brand')
     if not month_str or not post_id:
         return Response('Bad request', status=400)
-    if brand:
-        posts_list = read_calendar_brand(brand, month_str)
-        posts_list = [p for p in posts_list if p.get('id') != post_id]
-        save_calendar_brand(brand, month_str, posts_list)
-    else:
-        # sin brand: buscar en todas las marcas
-        for b in get_all_brand_tasks():
-            posts_list = read_calendar_brand(b, month_str)
-            filtered = [p for p in posts_list if p.get('id') != post_id]
-            if len(filtered) < len(posts_list):
-                save_calendar_brand(b, month_str, filtered)
-                break
+    try:
+        if brand:
+            posts_list = read_calendar_brand(brand, month_str)
+            posts_list = [p for p in posts_list if p.get('id') != post_id]
+            save_calendar_brand(brand, month_str, posts_list)
+        else:
+            # sin brand: buscar en todas las marcas
+            for b in get_all_brand_tasks():
+                posts_list = read_calendar_brand(b, month_str)
+                filtered = [p for p in posts_list if p.get('id') != post_id]
+                if len(filtered) < len(posts_list):
+                    save_calendar_brand(b, month_str, filtered)
+                    break
+    except Exception as e:
+        print(f'calendar_delete_route error: {e}')
+        return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
+                        status=500, mimetype='application/json')
     return Response('OK', status=200)
 
 @app.route('/calendar/restore-backup', methods=['POST'])
