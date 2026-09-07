@@ -12,6 +12,12 @@ TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 CLICKUP_TOKEN = os.environ['CLICKUP_TOKEN']
 META_TOKEN = os.environ['META_TOKEN']
 ANTHROPIC_KEY = os.environ['ANTHROPIC_API_KEY']
+# Publicador automático EBDS (System User separado — no toca META_TOKEN existente)
+META_PUBLISH_TOKEN = os.environ.get('META_PUBLISH_TOKEN', '')
+ZOHO_WORKDRIVE_CLIENT_ID     = os.environ.get('ZOHO_WORKDRIVE_CLIENT_ID', '')
+ZOHO_WORKDRIVE_CLIENT_SECRET = os.environ.get('ZOHO_WORKDRIVE_CLIENT_SECRET', '')
+ZOHO_WORKDRIVE_REFRESH_TOKEN = os.environ.get('ZOHO_WORKDRIVE_REFRESH_TOKEN', '')
+MEDIA_PROXY_SECRET = os.environ.get('MEDIA_PROXY_SECRET', '')
 ZOHO_CLIENT_ID     = os.environ.get('ZOHO_CLIENT_ID', '')
 ZOHO_CLIENT_SECRET = os.environ.get('ZOHO_CLIENT_SECRET', '')
 ZOHO_REFRESH_TOKEN = os.environ.get('ZOHO_REFRESH_TOKEN', '')
@@ -154,6 +160,200 @@ def _zoho_get_all(module, params, client='bhu', max_pages=10):
         if not info.get('more_records', False) or len(batch) < 200:
             break
     return all_data
+
+# --- Zoho WorkDrive (assets del calendario de contenido) ---
+# Datacenter global (.com) — cuenta marketing@behind-u.net, distinta de ZOHO_EBDS_* (CRM, .eu)
+WORKDRIVE_ROOT_FOLDER_ID = 'ap7j2be1143b53fc54e9280b66f2e8b3c6474'  # carpeta "2026"
+MESES_ES = ['ENERO','FEBRERO','MARZO','ABRIL','MAYO','JUNIO','JULIO','AGOSTO',
+            'SEPTIEMBRE','OCTUBRE','NOVIEMBRE','DICIEMBRE']
+_workdrive_token = {'token': '', 'expires': 0}
+
+def workdrive_get_token():
+    now = datetime.utcnow().timestamp()
+    if _workdrive_token['token'] and now < _workdrive_token['expires']:
+        return _workdrive_token['token']
+    params = urllib.parse.urlencode({
+        'grant_type': 'refresh_token',
+        'client_id': ZOHO_WORKDRIVE_CLIENT_ID,
+        'client_secret': ZOHO_WORKDRIVE_CLIENT_SECRET,
+        'refresh_token': ZOHO_WORKDRIVE_REFRESH_TOKEN,
+    })
+    req = urllib.request.Request(f'https://accounts.zoho.com/oauth/v2/token?{params}', data=b'', method='POST')
+    with urllib.request.urlopen(req, timeout=15) as r:
+        resp = json.loads(r.read())
+    token = resp.get('access_token', '')
+    _workdrive_token['token'] = token
+    _workdrive_token['expires'] = now + 3300
+    return token
+
+def workdrive_list(folder_id):
+    """Lista los archivos/carpetas dentro de una carpeta de WorkDrive."""
+    token = workdrive_get_token()
+    req = urllib.request.Request(
+        f'https://www.zohoapis.com/workdrive/api/v1/files/{folder_id}/files',
+        headers={'Authorization': f'Zoho-oauthtoken {token}'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read())
+    return data.get('data', [])
+
+def workdrive_download(file_id):
+    """Descarga el contenido binario de un archivo de WorkDrive. Devuelve (bytes, content_type)."""
+    token = workdrive_get_token()
+    req = urllib.request.Request(
+        f'https://www.zohoapis.com/workdrive/api/v1/download/{file_id}',
+        headers={'Authorization': f'Zoho-oauthtoken {token}'})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read(), r.headers.get('Content-Type', 'application/octet-stream')
+
+def workdrive_find_post_asset(date_str, post_type):
+    """Busca en WorkDrive (2026/MES/) la carpeta o archivo que empieza con '{date_str}_{post_type}'.
+    Devuelve una lista de file_ids en orden (varios para Carrusel, uno para el resto). [] si no hay match."""
+    year, month, _day = date_str.split('-')
+    mes_name = MESES_ES[int(month) - 1]
+    year_items = workdrive_list(WORKDRIVE_ROOT_FOLDER_ID)
+    mes_folder = next((i for i in year_items if i['attributes']['name'].strip().upper() == mes_name), None)
+    if not mes_folder:
+        return []
+    mes_items = workdrive_list(mes_folder['id'])
+    prefix = f'{date_str}_{post_type}'
+    matches = [i for i in mes_items if i['attributes']['name'].startswith(prefix)]
+    if not matches:
+        return []
+    target = matches[0]
+    if target['attributes'].get('is_folder'):
+        files = [f for f in workdrive_list(target['id']) if not f['attributes'].get('is_folder')]
+        files.sort(key=lambda f: f['attributes']['name'])
+        return [f['id'] for f in files]
+    return [target['id']]
+
+def media_proxy_url(file_id):
+    """URL pública (vía nuestro propio proxy) que Meta puede usar para leer un asset de WorkDrive."""
+    base = request.url_root.rstrip('/')
+    return f'{base}/media-proxy/{file_id}?t={MEDIA_PROXY_SECRET}'
+
+
+# --- Publicador Meta (Facebook + Instagram) ---
+GRAPH = 'https://graph.facebook.com/v21.0'
+
+def meta_publish_fb_photo(page_id, image_url, caption):
+    data = urllib.parse.urlencode({'url': image_url, 'caption': caption, 'access_token': META_PUBLISH_TOKEN}).encode()
+    req = urllib.request.Request(f'{GRAPH}/{page_id}/photos', data=data, method='POST')
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+def meta_ig_create_container(ig_id, media_url, caption='', media_type=None, is_carousel_item=False):
+    params = {'access_token': META_PUBLISH_TOKEN}
+    if media_type == 'REELS':
+        params.update(media_type='REELS', video_url=media_url)
+    elif media_type == 'STORIES':
+        params.update(media_type='STORIES', image_url=media_url)
+    else:
+        params['image_url'] = media_url
+    if is_carousel_item:
+        params['is_carousel_item'] = 'true'
+    elif caption:
+        params['caption'] = caption
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(f'{GRAPH}/{ig_id}/media', data=data, method='POST')
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read())
+    if 'id' not in resp:
+        raise Exception(f'IG container error: {resp}')
+    return resp['id']
+
+def meta_ig_create_carousel_container(ig_id, children_ids, caption):
+    params = {'media_type': 'CAROUSEL', 'children': ','.join(children_ids), 'caption': caption, 'access_token': META_PUBLISH_TOKEN}
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(f'{GRAPH}/{ig_id}/media', data=data, method='POST')
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read())
+    if 'id' not in resp:
+        raise Exception(f'IG carousel container error: {resp}')
+    return resp['id']
+
+def meta_ig_publish(ig_id, creation_id):
+    import time
+    # Reels/videos necesitan procesarse antes de poder publicarse — reintentar unos segundos.
+    for _ in range(10):
+        data = urllib.parse.urlencode({'creation_id': creation_id, 'access_token': META_PUBLISH_TOKEN}).encode()
+        req = urllib.request.Request(f'{GRAPH}/{ig_id}/media_publish', data=data, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read())
+            if 'not ready' in json.dumps(body).lower() or body.get('error', {}).get('code') == 9007:
+                time.sleep(3)
+                continue
+            raise Exception(f'IG publish error: {body}')
+    raise Exception('IG publish: media no quedó lista a tiempo')
+
+def publish_post_to_meta(brand_client, post):
+    """Publica UN post (dict del calendario) en Meta/Instagram según su 'type'. Devuelve dict con resultado."""
+    acc = next((a for a in SOCIAL_ACCOUNTS if a['client'] == brand_client), None)
+    if not acc:
+        raise Exception(f'No hay SOCIAL_ACCOUNTS configurado para {brand_client}')
+    file_ids = workdrive_find_post_asset(post['date'], post['type'])
+    if not file_ids:
+        raise Exception(f"No se encontró el asset en WorkDrive para {post['date']}_{post['type']}")
+    caption = (post.get('copy') or '') + (('\n\n' + post['hashtags']) if post.get('hashtags') else '')
+    ptype = post['type']
+    result = {}
+
+    if ptype == 'Post':
+        url = media_proxy_url(file_ids[0])
+        result['facebook'] = meta_publish_fb_photo(acc['fb'], url, caption)
+        cid = meta_ig_create_container(acc['ig'], url, caption)
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    elif ptype == 'Carrusel':
+        children = [meta_ig_create_container(acc['ig'], media_proxy_url(fid), is_carousel_item=True) for fid in file_ids]
+        cid = meta_ig_create_carousel_container(acc['ig'], children, caption)
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    elif ptype == 'Reel':
+        url = media_proxy_url(file_ids[0])
+        cid = meta_ig_create_container(acc['ig'], url, caption, media_type='REELS')
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    elif ptype == 'Story':
+        url = media_proxy_url(file_ids[0])
+        cid = meta_ig_create_container(acc['ig'], url, media_type='STORIES')
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    else:
+        raise Exception(f"Tipo '{ptype}' no soportado por el publicador automático todavía")
+
+    return result
+
+def publish_scheduled_posts(brands=('EBDS',)):
+    """Cron: para cada marca, busca los posts de HOY con status 'aprobado' y los publica.
+    Marca cada post publicado con post['_published']=True (para no publicarlo dos veces)."""
+    today = dt.date.today().isoformat()
+    month_str = today[:7]
+    for brand in brands:
+        try:
+            posts = read_calendar_brand(brand, month_str)
+        except Exception as e:
+            tg_send(f'⚠️ Publicador: error leyendo calendario de {brand}: {e}')
+            continue
+        changed = False
+        for post in posts:
+            if post.get('date') != today or post.get('status') != 'aprobado' or post.get('_published'):
+                continue
+            try:
+                publish_post_to_meta(brand, post)
+                post['_published'] = True
+                changed = True
+                tg_send(f"✅ Publicado — {brand} — {post['type']} — {post.get('titulo','')}")
+            except Exception as e:
+                tg_send(f"⚠️ Error publicando {brand} — {post['type']} — {post.get('titulo','')}\n{e}")
+        if changed:
+            try:
+                save_calendar_brand(brand, month_str, posts)
+            except Exception as e:
+                print(f'publish_scheduled_posts save error {brand}: {e}')
+
 
 def zoho_crm_funnel(month_date=None):
     """
@@ -4000,6 +4200,43 @@ def cron_check_posts():
     except Exception as e:
         print(f'Check posts error: {e}')
     return Response('OK', status=200)
+
+@app.route('/media-proxy/<file_id>', methods=['GET'])
+def media_proxy(file_id):
+    """Sirve un archivo de WorkDrive públicamente (sin auth de Zoho) para que Meta pueda leerlo.
+    Protegido por un token compartido en el query string — no por seguridad fuerte, solo para
+    evitar que cualquiera lo use para gastar ancho de banda/quota de WorkDrive."""
+    if request.args.get('t') != MEDIA_PROXY_SECRET:
+        return Response('Forbidden', status=403)
+    try:
+        content, ctype = workdrive_download(file_id)
+        return Response(content, mimetype=ctype)
+    except Exception as e:
+        return Response(f'Error: {e}', status=500)
+
+@app.route('/cron/publish-scheduled', methods=['GET', 'POST'])
+def cron_publish_scheduled():
+    try:
+        publish_scheduled_posts()
+    except Exception as e:
+        print(f'Publish scheduled error: {e}')
+        tg_send(f'⚠️ Publicador: error general — {e}')
+    return Response('OK', status=200)
+
+@app.route('/debug/test-publish', methods=['GET'])
+def debug_test_publish():
+    """Prueba manual: publica UN post puntual sin depender del calendario ni del status 'aprobado'.
+    Uso: /debug/test-publish?brand=EBDS&date=2026-09-07&type=Post"""
+    brand = request.args.get('brand', 'EBDS')
+    date = request.args.get('date', '')
+    ptype = request.args.get('type', '')
+    if not date or not ptype:
+        return jsonify({'error': "Pasá ?date=YYYY-MM-DD&type=Post|Carrusel|Reel|Story"}), 400
+    try:
+        result = publish_post_to_meta(brand, {'date': date, 'type': ptype, 'copy': request.args.get('copy', '(prueba)'), 'hashtags': ''})
+        return jsonify({'ok': True, 'result': result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/calendar/generate', methods=['GET', 'POST'])
 def calendar_generate():
