@@ -235,11 +235,15 @@ def media_proxy_url(file_id):
 # --- Publicador Meta (Facebook + Instagram) ---
 GRAPH = 'https://graph.facebook.com/v21.0'
 
-def meta_publish_fb_photo(page_id, image_url, caption):
-    data = urllib.parse.urlencode({'url': image_url, 'caption': caption, 'access_token': META_PUBLISH_TOKEN}).encode()
-    req = urllib.request.Request(f'{GRAPH}/{page_id}/photos', data=data, method='POST')
+def _graph_post(path, params):
+    """POST a la Graph API con los parámetros en el query string (formato que espera Meta)."""
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f'{GRAPH}/{path}?{qs}', data=b'', method='POST')
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
+
+def meta_publish_fb_photo(page_id, image_url, caption):
+    return _graph_post(f'{page_id}/photos', {'url': image_url, 'caption': caption, 'access_token': META_PUBLISH_TOKEN})
 
 def meta_ig_create_container(ig_id, media_url, caption='', media_type=None, is_carousel_item=False):
     params = {'access_token': META_PUBLISH_TOKEN}
@@ -253,20 +257,14 @@ def meta_ig_create_container(ig_id, media_url, caption='', media_type=None, is_c
         params['is_carousel_item'] = 'true'
     elif caption:
         params['caption'] = caption
-    data = urllib.parse.urlencode(params).encode()
-    req = urllib.request.Request(f'{GRAPH}/{ig_id}/media', data=data, method='POST')
-    with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.loads(r.read())
+    resp = _graph_post(f'{ig_id}/media', params)
     if 'id' not in resp:
         raise Exception(f'IG container error: {resp}')
     return resp['id']
 
 def meta_ig_create_carousel_container(ig_id, children_ids, caption):
     params = {'media_type': 'CAROUSEL', 'children': ','.join(children_ids), 'caption': caption, 'access_token': META_PUBLISH_TOKEN}
-    data = urllib.parse.urlencode(params).encode()
-    req = urllib.request.Request(f'{GRAPH}/{ig_id}/media', data=data, method='POST')
-    with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.loads(r.read())
+    resp = _graph_post(f'{ig_id}/media', params)
     if 'id' not in resp:
         raise Exception(f'IG carousel container error: {resp}')
     return resp['id']
@@ -275,11 +273,8 @@ def meta_ig_publish(ig_id, creation_id):
     import time
     # Reels/videos necesitan procesarse antes de poder publicarse — reintentar unos segundos.
     for _ in range(10):
-        data = urllib.parse.urlencode({'creation_id': creation_id, 'access_token': META_PUBLISH_TOKEN}).encode()
-        req = urllib.request.Request(f'{GRAPH}/{ig_id}/media_publish', data=data, method='POST')
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return json.loads(r.read())
+            return _graph_post(f'{ig_id}/media_publish', {'creation_id': creation_id, 'access_token': META_PUBLISH_TOKEN})
         except urllib.error.HTTPError as e:
             body = json.loads(e.read())
             if 'not ready' in json.dumps(body).lower() or body.get('error', {}).get('code') == 9007:
