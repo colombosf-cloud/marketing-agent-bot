@@ -194,7 +194,7 @@ def workdrive_list(folder_id):
     token = workdrive_get_token()
     req = urllib.request.Request(
         f'https://www.zohoapis.com/workdrive/api/v1/files/{folder_id}/files',
-        headers={'Authorization': f'Zoho-oauthtoken {token}'})
+        headers={'Authorization': f'Zoho-oauthtoken {token}', 'Accept': 'application/vnd.api+json'})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             data = json.loads(r.read())
