@@ -271,8 +271,34 @@ def _graph_post(path, params):
         body = e.read().decode('utf-8', errors='replace')
         raise Exception(f'Graph API {e.code} en {path}: {body}')
 
+_page_token_cache = {}
+
+def get_page_access_token(page_id):
+    """Publicar en una Página de Facebook requiere un Page Access Token propio de esa página,
+    no el token del System User directamente — se obtiene intercambiándolo una vez."""
+    if page_id in _page_token_cache:
+        return _page_token_cache[page_id]
+    resp = _graph_post_as_get(f'{page_id}', {'fields': 'access_token', 'access_token': META_PUBLISH_TOKEN})
+    token = resp.get('access_token')
+    if not token:
+        raise Exception(f'No se pudo obtener el Page Access Token de {page_id}: {resp}')
+    _page_token_cache[page_id] = token
+    return token
+
+def _graph_post_as_get(path, params):
+    """GET a la Graph API (para endpoints de lectura, ej. intercambio de token de página)."""
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f'{GRAPH}/{path}?{qs}', method='GET')
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        raise Exception(f'Graph API {e.code} en GET {path}: {body}')
+
 def meta_publish_fb_photo(page_id, image_url, caption):
-    return _graph_post(f'{page_id}/photos', {'url': image_url, 'caption': caption, 'access_token': META_PUBLISH_TOKEN})
+    page_token = get_page_access_token(page_id)
+    return _graph_post(f'{page_id}/photos', {'url': image_url, 'caption': caption, 'access_token': page_token})
 
 def meta_ig_create_container(ig_id, media_url, caption='', media_type=None, is_carousel_item=False):
     params = {'access_token': META_PUBLISH_TOKEN}
@@ -5699,3 +5725,4 @@ def paid_media_report_route():
 
     html = build_paid_media_html(client_name, meta_data, crm_data, month_date)
     return Response(html, mimetype='text/html')
+
