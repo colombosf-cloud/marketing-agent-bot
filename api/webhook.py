@@ -340,6 +340,21 @@ def publish_post_to_meta(brand_client, post):
 
     return result
 
+def _safe_tg_send(text):
+    """Como tg_send, pero nunca revienta el flujo que la llama: si Telegram rechaza el
+    Markdown (común con textos de error que traen JSON crudo con _ * [ ] etc.), reintenta
+    en texto plano; si eso también falla, solo lo logueamos."""
+    try:
+        tg_send(text)
+    except Exception:
+        try:
+            http_req(
+                f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                'POST', {'chat_id': SOFIA_CHAT_ID, 'text': text}
+            )
+        except Exception as e2:
+            print(f'_safe_tg_send: no se pudo notificar ({e2}): {text[:200]}')
+
 def publish_scheduled_posts(brands=('EBDS',)):
     """Cron: para cada marca, busca los posts de HOY con status 'aprobado' y los publica.
     Marca cada post publicado con post['_published']=True (para no publicarlo dos veces)."""
@@ -349,7 +364,7 @@ def publish_scheduled_posts(brands=('EBDS',)):
         try:
             posts = read_calendar_brand(brand, month_str)
         except Exception as e:
-            tg_send(f'⚠️ Publicador: error leyendo calendario de {brand}: {e}')
+            _safe_tg_send(f'⚠️ Publicador: error leyendo calendario de {brand}: {e}')
             continue
         changed = False
         for post in posts:
@@ -359,9 +374,9 @@ def publish_scheduled_posts(brands=('EBDS',)):
                 publish_post_to_meta(brand, post)
                 post['_published'] = True
                 changed = True
-                tg_send(f"✅ Publicado — {brand} — {post['type']} — {post.get('titulo','')}")
+                _safe_tg_send(f"✅ Publicado — {brand} — {post['type']} — {post.get('titulo','')}")
             except Exception as e:
-                tg_send(f"⚠️ Error publicando {brand} — {post['type']} — {post.get('titulo','')}\n{e}")
+                _safe_tg_send(f"⚠️ Error publicando {brand} — {post['type']} — {post.get('titulo','')}\n{e}")
         if changed:
             try:
                 save_calendar_brand(brand, month_str, posts)
@@ -4234,7 +4249,7 @@ def cron_publish_scheduled():
         publish_scheduled_posts()
     except Exception as e:
         print(f'Publish scheduled error: {e}')
-        tg_send(f'⚠️ Publicador: error general — {e}')
+        _safe_tg_send(f'⚠️ Publicador: error general — {e}')
     return Response('OK', status=200)
 
 @app.route('/debug/test-publish', methods=['GET'])
