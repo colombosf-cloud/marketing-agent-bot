@@ -223,6 +223,22 @@ def workdrive_find_post_asset(date_str, post_type):
     if target['attributes'].get('is_folder'):
         files = [f for f in workdrive_list(target['id']) if not f['attributes'].get('is_folder')]
         files.sort(key=lambda f: f['attributes']['name'])
+        if post_type != 'Carrusel' and len(files) > 1:
+            # La carpeta puede traer, además del asset pedido, el de otro formato del mismo día
+            # (ej: Post + Historia juntos) — filtramos por palabras clave del nombre de archivo.
+            OTHER_HINTS = {
+                'Post':    ['historia', 'story', 'reel'],
+                'Reel':    ['historia', 'story', 'post'],
+                'Story':   ['post', 'reel'],
+                'LinkedIn': ['historia', 'story', 'reel', 'post'],
+            }
+            own_hints = {'Story': ['historia', 'story'], 'Reel': ['reel']}.get(post_type, [])
+            hints = OTHER_HINTS.get(post_type, [])
+            preferred = [f for f in files if any(h in f['attributes']['name'].lower() for h in own_hints)] if own_hints else []
+            if not preferred:
+                preferred = [f for f in files if not any(h in f['attributes']['name'].lower() for h in hints)]
+            if preferred:
+                files = preferred
         return [f['id'] for f in files]
     return [target['id']]
 
@@ -239,8 +255,12 @@ def _graph_post(path, params):
     """POST a la Graph API con los parámetros en el query string (formato que espera Meta)."""
     qs = urllib.parse.urlencode(params)
     req = urllib.request.Request(f'{GRAPH}/{path}?{qs}', data=b'', method='POST')
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        raise Exception(f'Graph API {e.code} en {path}: {body}')
 
 def meta_publish_fb_photo(page_id, image_url, caption):
     return _graph_post(f'{page_id}/photos', {'url': image_url, 'caption': caption, 'access_token': META_PUBLISH_TOKEN})
@@ -275,12 +295,11 @@ def meta_ig_publish(ig_id, creation_id):
     for _ in range(10):
         try:
             return _graph_post(f'{ig_id}/media_publish', {'creation_id': creation_id, 'access_token': META_PUBLISH_TOKEN})
-        except urllib.error.HTTPError as e:
-            body = json.loads(e.read())
-            if 'not ready' in json.dumps(body).lower() or body.get('error', {}).get('code') == 9007:
+        except Exception as e:
+            if 'not ready' in str(e).lower() or '"code":9007' in str(e).replace(' ', ''):
                 time.sleep(3)
                 continue
-            raise Exception(f'IG publish error: {body}')
+            raise
     raise Exception('IG publish: media no quedó lista a tiempo')
 
 def publish_post_to_meta(brand_client, post):
