@@ -179,8 +179,11 @@ def workdrive_get_token():
         'refresh_token': ZOHO_WORKDRIVE_REFRESH_TOKEN,
     })
     req = urllib.request.Request(f'https://accounts.zoho.com/oauth/v2/token?{params}', data=b'', method='POST')
-    with urllib.request.urlopen(req, timeout=15) as r:
-        resp = json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise Exception(f'Zoho WorkDrive token {e.code}: {e.read().decode("utf-8", "replace")}')
     token = resp.get('access_token', '')
     _workdrive_token['token'] = token
     _workdrive_token['expires'] = now + 3300
@@ -192,8 +195,11 @@ def workdrive_list(folder_id):
     req = urllib.request.Request(
         f'https://www.zohoapis.com/workdrive/api/v1/files/{folder_id}/files',
         headers={'Authorization': f'Zoho-oauthtoken {token}'})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        data = json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise Exception(f'WorkDrive list {e.code} (folder {folder_id}): {e.read().decode("utf-8", "replace")}')
     return data.get('data', [])
 
 def workdrive_download(file_id):
@@ -202,8 +208,11 @@ def workdrive_download(file_id):
     req = urllib.request.Request(
         f'https://www.zohoapis.com/workdrive/api/v1/download/{file_id}',
         headers={'Authorization': f'Zoho-oauthtoken {token}'})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read(), r.headers.get('Content-Type', 'application/octet-stream')
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read(), r.headers.get('Content-Type', 'application/octet-stream')
+    except urllib.error.HTTPError as e:
+        raise Exception(f'WorkDrive download {e.code} (file {file_id}): {e.read().decode("utf-8", "replace")}')
 
 def workdrive_find_post_asset(date_str, post_type):
     """Busca en WorkDrive (2026/MES/) la carpeta o archivo que empieza con '{date_str}_{post_type}'.
