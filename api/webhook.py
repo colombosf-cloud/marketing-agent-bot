@@ -41,7 +41,8 @@ CLIENTS = {
     'pedia':     {'name': 'Pediapartner', 'meta': 'act_882383240407303', 'done': 'done'},
     'tivenos':  {'name': 'Tivenos', 'list_id': '901324496237', 'done': 'done'},
     'sibila':   {'name': 'Sibila',  'list_id': '901324495956', 'done': 'done'},
-    'zoweare':  {'name': 'ZoWeAre', 'done': 'done'},
+    'zoweare':  {'name': 'ZoWeAre', 'list_id': '901324494454', 'done': 'done'},
+    'heycourse': {'name': 'HeyCourse', 'list_id': '901716918882', 'done': 'complete'},
 }
 
 CAMPAIGN_CLIENTS = {
@@ -67,11 +68,12 @@ COUNTRY_CODES = {
 }
 
 WORKSPACES = {
-    '90132956644': {'name': 'BHU',     'done': 'hecho'},
-    '90132956682': {'name': 'EBDS',    'done': 'done'},
-    '90131113078': {'name': 'Tivenos', 'done': 'done'},
-    '90132956656': {'name': 'Sibila',  'done': 'done'},
-    '90132956693': {'name': 'ZoWeAre', 'done': 'done'},
+    '90132956644': {'name': 'BHU',       'done': 'hecho'},
+    '90132956682': {'name': 'EBDS',      'done': 'done'},
+    '90131113078': {'name': 'Tivenos',   'done': 'done'},
+    '90132956656': {'name': 'Sibila',    'done': 'done'},
+    '90132956693': {'name': 'ZoWeAre',   'done': 'done'},
+    '90171526256': {'name': 'HeyCourse', 'done': 'complete'},
 }
 
 # --- HTTP helpers ---
