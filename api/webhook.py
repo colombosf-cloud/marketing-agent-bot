@@ -1,4 +1,4 @@
-import json, os, re, csv, tempfile, base64
+import json, os, re, csv, tempfile, base64, time
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime
 import datetime as dt
@@ -775,15 +775,30 @@ def _brand_task(brand):
     return CALENDAR_TASK_ID
 
 def read_calendar_brand(brand, month_str=None):
-    """Lee los posts de UNA marca desde su tarea dedicada. Rápido (~15KB por marca)."""
-    try:
-        task = cu_get(f'task/{_brand_task(brand)}')
-        data = _decode_task_desc(task.get('description', '') or '')
-        if month_str:
-            return data.get(month_str, [])
-        return data   # {month_str: [posts]}
-    except Exception:
-        return {} if month_str is None else []
+    """Lee los posts de UNA marca desde su tarea dedicada. Rápido (~15KB por marca).
+
+    IMPORTANTE: ante un fallo (timeout, rate limit de ClickUp, etc.) reintenta una
+    vez y, si igual falla, LEVANTA la excepción en vez de devolver vacío.
+    Devolver {} / [] en un error se confunde con "no hay contenido este mes" —
+    y varios endpoints de guardado (save/delete/regenerate) usan ese resultado
+    para reescribir la tarea completa, lo que podía borrar meses enteros en
+    ClickUp con un simple error de red pasajero. Cada caller ya maneja la
+    excepción (o la deja fallar limpio con 500) en vez de guardar datos vacíos."""
+    task_id = _brand_task(brand)
+    last_err = None
+    for attempt in range(2):
+        try:
+            task = cu_get(f'task/{task_id}')
+            data = _decode_task_desc(task.get('description', '') or '')
+            if month_str:
+                return data.get(month_str, [])
+            return data   # {month_str: [posts]}
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(0.5)
+    print(f'read_calendar_brand {brand} falló tras reintento: {last_err}')
+    raise RuntimeError(f'No se pudo leer el calendario de {brand}: {last_err}')
 
 def save_calendar_brand(brand, month_str, posts):
     """Escribe los posts de UNA marca en su tarea dedicada.
@@ -2745,12 +2760,15 @@ def read_brands_parallel(brands, month_str=None):
     """Lee varias marcas en paralelo desde ClickUp (en vez de una por una).
     Es la causa principal de la lentitud al navegar entre meses: antes eran
     N llamadas HTTP secuenciales a ClickUp, ahora corren todas al mismo tiempo.
-    Devuelve {brand: data}, donde data es [posts] si se pasó month_str,
-    o {month_str: [posts]} si no."""
+    Devuelve (results, failed): results es {brand: data} solo con las marcas
+    que se pudieron leer (data es [posts] si se pasó month_str, o
+    {month_str: [posts]} si no) y failed es la lista de marcas que fallaron
+    (para NO confundirlas con "sin contenido este mes")."""
     results = {}
+    failed = []
     brands = list(brands)
     if not brands:
-        return results
+        return results, failed
     with ThreadPoolExecutor(max_workers=min(8, len(brands))) as ex:
         futures = {ex.submit(read_calendar_brand, b, month_str): b for b in brands}
         for fut in as_completed(futures):
@@ -2759,14 +2777,19 @@ def read_brands_parallel(brands, month_str=None):
                 results[b] = fut.result()
             except Exception as e:
                 print(f'read_brands_parallel {b}: {e}')
-                results[b] = [] if month_str else {}
-    return results
+                failed.append(b)
+    return results, failed
 
 def get_calendar_data(month_str=None):
     """Lee datos del calendario (todas las marcas) desde las tareas dedicadas, en paralelo.
-    Devuelve {brand: [posts]} para un mes, o {month: {brand: [posts]}} sin mes."""
+    Devuelve {brand: [posts]} para un mes, o {month: {brand: [posts]}} sin mes.
+    Si alguna marca falló al leer, se omite del resultado (no se confunde con
+    vacío) y queda logueado — este helper se usa solo para conteos informativos,
+    no para guardar nada."""
     try:
-        brand_results = read_brands_parallel(get_all_brand_tasks().keys(), month_str)
+        brand_results, failed = read_brands_parallel(get_all_brand_tasks().keys(), month_str)
+        if failed:
+            print(f'get_calendar_data: marcas con error de lectura: {failed}')
         if month_str:
             return {b: posts for b, posts in brand_results.items() if posts}
         brands_data = {}
@@ -3503,12 +3526,43 @@ async function fetchMonth(m){
   return await r.json();
 }
 
-async function load(autoAdvance){
+function showLoadWarning(brands,gaveUp){
+  let el=document.getElementById(\'load-warning\');
+  if(!el){
+    el=document.createElement(\'div\');
+    el.id=\'load-warning\';
+    el.style.cssText=\'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#fef3c7;color:#92400e;border:1px solid #f59e0b;padding:8px 14px;border-radius:8px;font-size:13px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,.15)\';
+    document.body.appendChild(el);
+  }
+  el.textContent=gaveUp
+    ? \'⚠️ No se pudo cargar: \'+brands.join(\', \')+\' — el contenido sigue en ClickUp, recargá la página en un momento.\'
+    : \'⚠️ No se pudo cargar: \'+brands.join(\', \')+\' — reintentando… (el contenido no se perdió)\';
+  el.style.display=\'block\';
+}
+function hideLoadWarning(){
+  const el=document.getElementById(\'load-warning\');
+  if(el)el.style.display=\'none\';
+}
+
+async function load(autoAdvance,retryCount){
+  retryCount=retryCount||0;
   try{
     const cached=monthCache[curMonth];
     let d=cached;
     if(!d){
       d=await fetchMonth(curMonth);
+      if(d.errors&&d.errors.length){
+        // Un fallo de lectura (rate limit, timeout) NO es "mes vacío" — no se
+        // cachea ni se pinta como si no hubiera contenido, se avisa y reintenta.
+        if(retryCount<5){
+          showLoadWarning(d.errors,false);
+          setTimeout(()=>load(autoAdvance,retryCount+1),3000);
+        }else{
+          showLoadWarning(d.errors,true);
+        }
+        return;
+      }
+      hideLoadWarning();
       monthCache[curMonth]=d;
     }
     data=d.posts||{};
@@ -3533,6 +3587,11 @@ async function load(autoAdvance){
 async function refreshMonthInBackground(m){
   try{
     const d=await fetchMonth(m);
+    if(d.errors&&d.errors.length){
+      // No pisar los datos buenos que ya están en pantalla con un refresh fallido
+      console.warn(\'refresh en segundo plano falló para:\',d.errors);
+      return;
+    }
     monthCache[m]=d;
     if(m===curMonth){
       data=d.posts||{};
@@ -4601,7 +4660,8 @@ def calendar_page():
         today = dt.date.today()
         # Leer todas las marcas en paralelo en lugar de una por una
         months_with_data = set()
-        for brand_data in read_brands_parallel(get_all_brand_tasks().keys()).values():
+        brands_data_all, _failed = read_brands_parallel(get_all_brand_tasks().keys())
+        for brand_data in brands_data_all.values():
             for ms, posts in (brand_data or {}).items():
                 if posts:
                     months_with_data.add(ms)
@@ -4625,6 +4685,7 @@ def calendar_data_route():
         f_state = ex.submit(read_state)
         brand_futs = {ex.submit(read_calendar_brand, b, month_str): b for b in brand_tasks}
         month_data = {}
+        failed_brands = []
         for fut in as_completed(brand_futs):
             b = brand_futs[fut]
             try:
@@ -4632,7 +4693,11 @@ def calendar_data_route():
                 if posts:
                     month_data[b] = posts
             except Exception as e:
+                # No confundir "falló la lectura" con "no hay posts este mes":
+                # se reporta aparte en 'errors' para que el frontend avise y
+                # reintente, en vez de mostrar (y cachear) el mes como vacío.
                 print(f'calendar_data_route {b}: {e}')
+                failed_brands.append(b)
         try:
             state = f_state.result()
         except Exception as e:
@@ -4640,7 +4705,7 @@ def calendar_data_route():
             state = {}
     brands = [b for b in brand_tasks if b in month_data]
     designer_checks = state.get('designer_checks', [])
-    return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks}, ensure_ascii=False), mimetype='application/json')
+    return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks, 'errors': failed_brands}, ensure_ascii=False), mimetype='application/json')
 
 @app.route('/calendar/save', methods=['POST'])
 def calendar_save_route():
@@ -4808,12 +4873,17 @@ def calendar_regenerate_post_route():
         return Response('Bad request', status=400)
     # Buscar el post en las tareas de las marcas
     found_post = None; found_brand = None
-    for b in get_all_brand_tasks():
-        posts_list = read_calendar_brand(b, month_str)
-        for p in posts_list:
-            if p.get('id') == post_id:
-                found_post = p; found_brand = b; break
-        if found_post: break
+    try:
+        for b in get_all_brand_tasks():
+            posts_list = read_calendar_brand(b, month_str)
+            for p in posts_list:
+                if p.get('id') == post_id:
+                    found_post = p; found_brand = b; break
+            if found_post: break
+    except Exception as e:
+        print(f'calendar_regenerate_post_route search error: {e}')
+        return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
+                        status=500, mimetype='application/json')
     if not found_post:
         return Response('Post not found', status=404)
     try:
