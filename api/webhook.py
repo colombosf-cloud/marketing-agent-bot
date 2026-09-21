@@ -77,12 +77,25 @@ WORKSPACES = {
 }
 
 # --- HTTP helpers ---
-def http_req(url, method='GET', data=None, headers=None):
+def http_req(url, method='GET', data=None, headers=None, retries=0, retry_delay=0.6):
+    """retries>0 reintenta ante timeouts/errores de red antes de levantar la
+    excepción. Solo se usa para GET/PUT (idempotentes — repetirlos no duplica
+    nada). Nunca se usa para POST (crear tarea/comentario), porque si el POST
+    ya llegó a destino y solo se perdió la respuesta, reintentarlo crearía
+    un duplicado."""
     h = {'Content-Type': 'application/json', **(headers or {})}
     body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, headers=h, method=method)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read())
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, data=body, headers=h, method=method)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(retry_delay)
+    raise last_err
 
 def tg_send(text):
     http_req(
@@ -107,13 +120,15 @@ def tg_send_document(filepath, filename, caption='', mimetype='text/csv'):
         return json.loads(r.read())
 
 def cu_get(path):
-    return http_req(f'https://api.clickup.com/api/v2/{path}', headers={'Authorization': CLICKUP_TOKEN})
+    return http_req(f'https://api.clickup.com/api/v2/{path}', headers={'Authorization': CLICKUP_TOKEN}, retries=1)
 
 def cu_post(path, data):
+    # Sin retry: un POST crea algo (tarea, comentario). Si el timeout ocurre
+    # después de que ClickUp ya procesó el request, reintentar duplicaría.
     return http_req(f'https://api.clickup.com/api/v2/{path}', 'POST', data, {'Authorization': CLICKUP_TOKEN})
 
 def cu_put(path, data):
-    return http_req(f'https://api.clickup.com/api/v2/{path}', 'PUT', data, {'Authorization': CLICKUP_TOKEN})
+    return http_req(f'https://api.clickup.com/api/v2/{path}', 'PUT', data, {'Authorization': CLICKUP_TOKEN}, retries=1)
 
 # --- Zoho CRM ---
 _zoho_tokens = {'bhu': {'token': '', 'expires': 0}, 'ebds': {'token': '', 'expires': 0}}
