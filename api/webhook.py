@@ -828,6 +828,14 @@ def save_calendar(calendar_data, backup=False):
                 print(f'save_calendar brand={brand}: {e}')
 
 # --- Brands config (dinámico) ---
+# Caché corta en memoria: la config de marcas casi no cambia, pero /calendar/data
+# la pedía 2 veces por request (una en get_calendar_data, otra en calendar_data_route)
+# sumado a una llamada más por cada _brand_task() con marca dinámica. Cachearla evita
+# llamadas redundantes a ClickUp dentro de la misma invocación (y en invocaciones
+# "calientes" de Vercel que reusan el proceso).
+_brands_config_cache = {'data': None, 'ts': 0}
+_BRANDS_CONFIG_TTL = 120  # segundos
+
 def read_brands_config():
     """Lee la config de marcas desde ClickUp. Fallback a _BRANDS_DEFAULT."""
     try:
@@ -842,13 +850,21 @@ def read_brands_config():
 def save_brands_config(config):
     """Guarda la config de marcas en ClickUp."""
     cu_put(f'task/{BRANDS_CONFIG_TASK_ID}', {'markdown_description': _encode_for_clickup(config)})
+    _brands_config_cache['data'] = dict(config)
+    _brands_config_cache['ts'] = datetime.utcnow().timestamp()
 
 def get_brands_config():
-    """Lee config, si está vacía migra desde defaults y guarda."""
+    """Lee config (con caché corta en memoria), si está vacía migra desde defaults y guarda."""
+    now = datetime.utcnow().timestamp()
+    if _brands_config_cache['data'] is not None and now - _brands_config_cache['ts'] < _BRANDS_CONFIG_TTL:
+        return _brands_config_cache['data']
     cfg = read_brands_config()
     if not cfg:
         cfg = dict(_BRANDS_DEFAULT)
         save_brands_config(cfg)
+        return cfg
+    _brands_config_cache['data'] = cfg
+    _brands_config_cache['ts'] = now
     return cfg
 
 def get_all_brand_tasks():
@@ -2725,22 +2741,38 @@ def check_new_posts(state):
 
 # ─── CALENDAR HELPERS ──────────────────────────────────────────────────────────
 
+def read_brands_parallel(brands, month_str=None):
+    """Lee varias marcas en paralelo desde ClickUp (en vez de una por una).
+    Es la causa principal de la lentitud al navegar entre meses: antes eran
+    N llamadas HTTP secuenciales a ClickUp, ahora corren todas al mismo tiempo.
+    Devuelve {brand: data}, donde data es [posts] si se pasó month_str,
+    o {month_str: [posts]} si no."""
+    results = {}
+    brands = list(brands)
+    if not brands:
+        return results
+    with ThreadPoolExecutor(max_workers=min(8, len(brands))) as ex:
+        futures = {ex.submit(read_calendar_brand, b, month_str): b for b in brands}
+        for fut in as_completed(futures):
+            b = futures[fut]
+            try:
+                results[b] = fut.result()
+            except Exception as e:
+                print(f'read_brands_parallel {b}: {e}')
+                results[b] = [] if month_str else {}
+    return results
+
 def get_calendar_data(month_str=None):
-    """Lee datos del calendario (todas las marcas) desde las tareas dedicadas.
+    """Lee datos del calendario (todas las marcas) desde las tareas dedicadas, en paralelo.
     Devuelve {brand: [posts]} para un mes, o {month: {brand: [posts]}} sin mes."""
     try:
+        brand_results = read_brands_parallel(get_all_brand_tasks().keys(), month_str)
+        if month_str:
+            return {b: posts for b, posts in brand_results.items() if posts}
         brands_data = {}
-        for brand in get_all_brand_tasks():
-            brand_months = read_calendar_brand(brand)  # {month_str: [posts]}
-            if month_str:
-                posts = brand_months.get(month_str, [])
-                if posts:
-                    brands_data[brand] = posts
-            else:
-                for m, posts in brand_months.items():
-                    if m not in brands_data:
-                        brands_data[m] = {}
-                    brands_data[m][brand] = posts
+        for brand, brand_months in brand_results.items():
+            for m, posts in brand_months.items():
+                brands_data.setdefault(m, {})[brand] = posts
         return brands_data
     except Exception as e:
         print(f'Cal get error: {e}')
@@ -3437,6 +3469,7 @@ const TI={Reel:\'\\uD83C\\uDFA5\',Carrusel:\'\\uD83D\\uDCF1\',Post:\'\\uD83D\\uD
 const SC={pendiente:\'#f59e0b\',aprobado:\'#22c55e\',con_cambios:\'#ef4444\'};
 const MN=[\'Enero\',\'Febrero\',\'Marzo\',\'Abril\',\'Mayo\',\'Junio\',\'Julio\',\'Agosto\',\'Septiembre\',\'Octubre\',\'Noviembre\',\'Diciembre\'];
 let curMonth=\'\',data={},active=\'all\',curPost=null,designerChecks=new Set();
+let monthCache={}; // {month: {posts,brands,designer_checks}} — evita re-pedir a ClickUp meses ya vistos
 
 async function loadBrandsConfig(){
   try{
@@ -3465,12 +3498,23 @@ const urlM=new URLSearchParams(location.search).get(\'month\');
 const n=new Date();
 curMonth=urlM||(n.getFullYear()+\'-\'+String(n.getMonth()+1).padStart(2,\'0\'));
 
+async function fetchMonth(m){
+  const r=await fetch(\'/calendar/data?key=\'+KEY+\'&month=\'+m);
+  return await r.json();
+}
+
 async function load(autoAdvance){
   try{
-    const r=await fetch(\'/calendar/data?key=\'+KEY+\'&month=\'+curMonth);
-    const d=await r.json();
+    const cached=monthCache[curMonth];
+    let d=cached;
+    if(!d){
+      d=await fetchMonth(curMonth);
+      monthCache[curMonth]=d;
+    }
     data=d.posts||{};
-    designerChecks=new Set(d.designer_checks||[]);
+    // El Set de checks solo se resetea en una carga fresca — si viene de caché
+    // no se toca, para no pisar toggles hechos después de que se cacheó ese mes.
+    if(!cached)designerChecks=new Set(d.designer_checks||[]);
     const total=Object.values(data).reduce((s,a)=>s+(Array.isArray(a)?a.length:0),0);
     // Si no hay datos y no se especificó mes en la URL, avanzar automáticamente al siguiente mes (una sola vez)
     if(total===0&&!autoAdvance&&!new URLSearchParams(location.search).get(\'month\')){
@@ -3481,7 +3525,21 @@ async function load(autoAdvance){
     renderCal();
     renderAgenda();
     renderExtras();
+    // Si se pintó desde caché, refrescar en segundo plano por si hubo cambios (desde el bot, otro dispositivo, etc.)
+    if(cached)refreshMonthInBackground(curMonth);
   }catch(e){console.error(e)}
+}
+
+async function refreshMonthInBackground(m){
+  try{
+    const d=await fetchMonth(m);
+    monthCache[m]=d;
+    if(m===curMonth){
+      data=d.posts||{};
+      renderTabs(d.brands||[]);
+      renderCal();renderAgenda();renderExtras();
+    }
+  }catch(e){console.warn(\'refresh bg:\',e);}
 }
 
 function renderTabs(brands){
@@ -3613,6 +3671,7 @@ function mkChip(p){
   chip.innerHTML=\'<div class="chip-dot" style="background:\'+bc+\'"></div>\'
     +\'<span class="chip-title">\'+(p.titulo||p.type)+\'</span>\'
     +\'<span class="chip-icon">\'+icon+\'</span>\'
+    +(p.diseno_link?\'<a href="\'+esc(p.diseno_link)+\'" target="_blank" rel="noopener" style="font-size:11px;padding:1px 3px;text-decoration:none" title="Ver diseño ya realizado" onclick="event.stopPropagation()">🔗</a>\':\'\')
     +\'<button class="btn-check\'+(chk?\' checked\':\'\')+\'" title="\'+(chk?\'Diseño listo ✓\':\'Marcar diseño como listo\')+\'">\'+(chk?\'✓\':\'○\')+\'</button>\'
     +\'<button class="btn-regen" style="font-size:11px;padding:1px 3px" title="Regenerar" onclick="openRegen(\'+cpKey+\',event)">🔄</button>\'
     +\'<button class="btn-del" title="Borrar" onclick="confirmDeleteChip(\'+cpKey+\',event)">✕</button>\'
@@ -3690,6 +3749,7 @@ function renderAgenda(){
         +\'<span class="agenda-brand" style="color:\'+bc+\'">\'+p.brand+\'</span>\'
         +\'<span class="agenda-title">\'+(p.titulo||\'\')+\'</span>\'
         +\'<div class="chip-status" style="background:\'+(SC[p.status]||\'#94a3b8\')+\';width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-right:4px"></div>\'
+        +(p.diseno_link?\'<a href="\'+esc(p.diseno_link)+\'" target="_blank" rel="noopener" style="font-size:14px;padding:2px 4px;flex-shrink:0;text-decoration:none" title="Ver diseño ya realizado" onclick="event.stopPropagation()">🔗</a>\':\'\')
         +\'<button class="btn-regen" style="font-size:14px;padding:2px 4px;flex-shrink:0" title="Regenerar" onclick="event.stopPropagation();openRegen(\'+pKey+\',event)">🔄</button>\';
       row.onclick=()=>openPost(p);
       block.appendChild(row);
@@ -3718,6 +3778,8 @@ function openPost(p){
     +\'<label>Pilar de contenido</label><input id="e-pilar" value="\'+esc(p.pilar||\'\')+\'">\'
     +\'<label>Objetivo</label><input id="e-objetivo" value="\'+esc(p.objetivo||\'\')+\'">\'
     +\'<label>&#127912; Texto de imagen / Descripci&oacute;n de pieza</label><textarea id="e-texto-imagen" style="min-height:90px;font-family:monospace;font-size:12px">\'+esc(p.texto_imagen||\'\')+\'</textarea>\'
+    +\'<label>&#129504; Prompt para dise&ntilde;o</label><textarea id="e-diseno-prompt" placeholder="Prompt para generar la pieza (IA de imagen, brief para diseñador, etc.)" style="min-height:70px;font-family:monospace;font-size:12px">\'+esc(p.diseno_prompt||\'\')+\'</textarea>\'
+    +\'<label>&#128279; Link del dise&ntilde;o ya realizado</label><input id="e-diseno-link" type="url" placeholder="https://..." value="\'+esc(p.diseno_link||\'\')+\'">\'
     +\'<label>Copy (caption para redes)</label><textarea id="e-copy">\'+esc(p.copy||\'\')+\'</textarea>\'
     +(p.hashtags!==undefined?\'<label>Hashtags</label><input id="e-hashtags" value="\'+esc(p.hashtags||\'\')+\'">\':\'\')
     +\'<label>Estado</label><select id="e-status">\'
@@ -3736,7 +3798,7 @@ function openPost(p){
 }
 
 function openNew(ds){
-  openPost({id:\'new-\'+Date.now(),brand:active!==\'all\'?active:\'EBDS\',date:ds,type:\'Post\',titulo:\'\',pilar:\'\',objetivo:\'\',texto_imagen:\'\',copy:\'\',hashtags:\'\',status:\'pendiente\',comments:\'\'});
+  openPost({id:\'new-\'+Date.now(),brand:active!==\'all\'?active:\'EBDS\',date:ds,type:\'Post\',titulo:\'\',pilar:\'\',objetivo:\'\',texto_imagen:\'\',diseno_prompt:\'\',diseno_link:\'\',copy:\'\',hashtags:\'\',status:\'pendiente\',comments:\'\'});
 }
 
 function updateModalHeader(){
@@ -3758,6 +3820,8 @@ async function savePost(){
     pilar:document.getElementById(\'e-pilar\').value,
     objetivo:document.getElementById(\'e-objetivo\').value,
     texto_imagen:document.getElementById(\'e-texto-imagen\').value,
+    diseno_prompt:document.getElementById(\'e-diseno-prompt\').value,
+    diseno_link:document.getElementById(\'e-diseno-link\').value,
     copy:document.getElementById(\'e-copy\').value,
     status:document.getElementById(\'e-status\').value,
     comments:document.getElementById(\'e-comments\').value
@@ -4535,16 +4599,12 @@ def calendar_page():
     if not request.args.get('month'):
         from flask import redirect
         today = dt.date.today()
-        # Leer una vez por marca (5 llamadas) en lugar de buscar en el estado del bot
+        # Leer todas las marcas en paralelo en lugar de una por una
         months_with_data = set()
-        for brand in get_all_brand_tasks():
-            try:
-                brand_data = read_calendar_brand(brand)  # {month_str: [posts]}
-                for ms, posts in brand_data.items():
-                    if posts:
-                        months_with_data.add(ms)
-            except Exception:
-                pass
+        for brand_data in read_brands_parallel(get_all_brand_tasks().keys()).values():
+            for ms, posts in (brand_data or {}).items():
+                if posts:
+                    months_with_data.add(ms)
         for delta in range(0, 7):
             d = today.replace(day=1) + dt.timedelta(days=32 * delta)
             ms = f'{d.year}-{str(d.month).zfill(2)}'
@@ -4558,9 +4618,27 @@ def calendar_data_route():
     if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
         return Response('{}', status=401, mimetype='application/json')
     month_str = request.args.get('month', dt.date.today().strftime('%Y-%m'))
-    month_data = get_calendar_data(month_str)
-    brands = [b for b in get_all_brand_tasks() if b in month_data]
-    state = read_state()
+    brand_tasks = get_all_brand_tasks()  # cacheado — ya no se pide 2 veces por request
+    # Leer todas las marcas + el estado del bot (designer_checks) en paralelo,
+    # en vez de secuencial, para que cambiar de mes sea rápido.
+    with ThreadPoolExecutor(max_workers=len(brand_tasks) + 1) as ex:
+        f_state = ex.submit(read_state)
+        brand_futs = {ex.submit(read_calendar_brand, b, month_str): b for b in brand_tasks}
+        month_data = {}
+        for fut in as_completed(brand_futs):
+            b = brand_futs[fut]
+            try:
+                posts = fut.result()
+                if posts:
+                    month_data[b] = posts
+            except Exception as e:
+                print(f'calendar_data_route {b}: {e}')
+        try:
+            state = f_state.result()
+        except Exception as e:
+            print(f'calendar_data_route state: {e}')
+            state = {}
+    brands = [b for b in brand_tasks if b in month_data]
     designer_checks = state.get('designer_checks', [])
     return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks}, ensure_ascii=False), mimetype='application/json')
 
