@@ -801,9 +801,15 @@ def read_calendar_brand(brand, month_str=None):
     excepción (o la deja fallar limpio con 500) en vez de guardar datos vacíos."""
     task_id = _brand_task(brand)
     last_err = None
+    # Un solo nivel de reintento: cu_get() ya reintenta una vez internamente
+    # (http_req retries=1), así que envolverlo en OTRO loop de reintento
+    # multiplicaba los intentos a 4 (hasta ~80s) — la causa de los timeouts
+    # constantes al guardar. Acá se llama a http_req() directo, sin el retry
+    # interno de cu_get, para que el único reintento sea este.
     for attempt in range(2):
         try:
-            task = cu_get(f'task/{task_id}')
+            task = http_req(f'https://api.clickup.com/api/v2/task/{task_id}',
+                             headers={'Authorization': CLICKUP_TOKEN})
             data = _decode_task_desc(task.get('description', '') or '')
             if month_str:
                 return data.get(month_str, [])
@@ -814,6 +820,18 @@ def read_calendar_brand(brand, month_str=None):
                 time.sleep(0.5)
     print(f'read_calendar_brand {brand} falló tras reintento: {last_err}')
     raise RuntimeError(f'No se pudo leer el calendario de {brand}: {last_err}')
+
+def _write_calendar_brand(brand, current):
+    """Escribe el dict completo {month_str: [posts]} de una marca en su tarea,
+    SIN leer antes — usar cuando el caller ya tiene el estado actual (por ej.
+    recién obtenido con read_calendar_brand) para no duplicar el GET."""
+    task_id = _brand_task(brand)
+    # Mantener máximo 3 meses por marca
+    months = sorted(current.keys())
+    if len(months) > 3:
+        for old in months[:-3]:
+            del current[old]
+    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(current)})
 
 def save_calendar_brand(brand, month_str, posts):
     """Escribe los posts de UNA marca en su tarea dedicada.
@@ -826,12 +844,19 @@ def save_calendar_brand(brand, month_str, posts):
     except Exception:
         current = {}
     current[month_str] = posts
-    # Mantener máximo 3 meses por marca
-    months = sorted(current.keys())
-    if len(months) > 3:
-        for old in months[:-3]:
-            del current[old]
-    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(current)})
+    _write_calendar_brand(brand, current)
+
+def _update_calendar_brand_month(brand, month_str, mutate_fn):
+    """Lee la tarea de la marca UNA sola vez, aplica mutate_fn a la lista de posts
+    del mes indicado y escribe UNA sola vez. save/delete individuales hacían un
+    read_calendar_brand() + save_calendar_brand() que entre los dos terminaban
+    pegándole 2 GET + 1 PUT a ClickUp para una sola edición — con ClickUp lento
+    eso solo ya superaba el timeout de 25s del cliente. Con esto queda en 1 GET + 1 PUT."""
+    brand_data = read_calendar_brand(brand)   # {month_str: [posts]} — 1 GET
+    posts_list = mutate_fn(brand_data.get(month_str, []))
+    brand_data[month_str] = posts_list
+    _write_calendar_brand(brand, brand_data)  # 1 PUT
+    return posts_list
 
 def read_calendar():
     """Lee el calendario completo (todas las marcas) para /calendar/data.
@@ -3906,7 +3931,7 @@ async function savePost(){
   if(btn){btn.disabled=true;btn.style.opacity=\'0.7\';btn.innerHTML=\'⏳ Guardando...\';}
   try{
     const ctrl=new AbortController();
-    const tid=setTimeout(()=>ctrl.abort(),25000);
+    const tid=setTimeout(()=>ctrl.abort(),45000);
     const r=await fetch(\'/calendar/save?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post:p}),signal:ctrl.signal});
     clearTimeout(tid);
     if(r.ok){
@@ -4737,15 +4762,15 @@ def calendar_save_route():
     if not brand:
         return Response('Bad request — falta brand en el post', status=400)
     try:
-        # Leer y escribir SOLO la tarea de esa marca (payload ~15KB en lugar de 107KB)
-        brand_data = read_calendar_brand(brand)      # {month_str: [posts]}
-        posts_list = brand_data.get(month_str, [])
-        idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
-        if idx >= 0:
-            posts_list[idx] = post
-        else:
-            posts_list.append(post)
-        save_calendar_brand(brand, month_str, posts_list)
+        # 1 GET + 1 PUT a la tarea de esa marca (payload ~15KB en lugar de 107KB)
+        def _apply(posts_list):
+            idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
+            if idx >= 0:
+                posts_list[idx] = post
+            else:
+                posts_list.append(post)
+            return posts_list
+        _update_calendar_brand_month(brand, month_str, _apply)
     except Exception as e:
         print(f'calendar_save_route error: {e}')
         return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
@@ -4836,9 +4861,8 @@ def calendar_delete_route():
         return Response('Bad request', status=400)
     try:
         if brand:
-            posts_list = read_calendar_brand(brand, month_str)
-            posts_list = [p for p in posts_list if p.get('id') != post_id]
-            save_calendar_brand(brand, month_str, posts_list)
+            _update_calendar_brand_month(brand, month_str,
+                lambda posts_list: [p for p in posts_list if p.get('id') != post_id])
         else:
             # sin brand: buscar en todas las marcas
             for b in get_all_brand_tasks():
