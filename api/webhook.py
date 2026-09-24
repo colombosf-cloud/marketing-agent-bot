@@ -1,4 +1,4 @@
-import json, os, re, csv, tempfile, base64, time
+import json, os, re, csv, tempfile, base64, time, gzip
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime
 import datetime as dt
@@ -737,11 +737,18 @@ _BRANDS_DEFAULT = {
 }
 
 def _decode_task_desc(desc):
-    """Decodifica base64 o JSON plano desde el campo description de una tarea ClickUp."""
+    """Decodifica base64+gzip (formato actual) o base64 plano / JSON plano (formatos
+    viejos, por compatibilidad hacia atrás) desde el campo description de una tarea
+    ClickUp."""
     if not desc or not desc.strip():
         return {}
     try:
-        return json.loads(base64.b64decode(desc.strip().encode()).decode('utf-8'))
+        raw = base64.b64decode(desc.strip().encode())
+        try:
+            raw = gzip.decompress(raw)   # formato actual (comprimido)
+        except OSError:
+            pass                          # formato viejo: base64 sin comprimir
+        return json.loads(raw.decode('utf-8'))
     except Exception:
         try:
             return json.loads(desc)
@@ -749,8 +756,14 @@ def _decode_task_desc(desc):
             return {}
 
 def _encode_for_clickup(data):
-    """Serializa dict a base64 para guardar en ClickUp."""
-    return base64.b64encode(json.dumps(data, ensure_ascii=False).encode('utf-8')).decode('ascii')
+    """Serializa dict a JSON, comprime con gzip y codifica en base64 para guardar en
+    ClickUp. El calendario de una marca con 2-3 meses de posts pesa ~100KB en base64
+    sin comprimir — eso, no la cantidad de llamadas, es lo que hacía que ClickUp
+    tardara tanto en cada guardado/lectura. Con gzip (antes de base64 — comprimir
+    después no sirve, base64 ya no compacta) el payload baja ~70%, a ~30KB."""
+    raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
+    compressed = gzip.compress(raw, compresslevel=6)
+    return base64.b64encode(compressed).decode('ascii')
 
 def read_state():
     """Lee SOLO el estado del bot (last_offset, validar, etc.).
