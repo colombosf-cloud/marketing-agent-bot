@@ -714,8 +714,11 @@ STATE_DEFAULTS = {
     'last_post_ids': {},
 }
 
-# Tareas dedicadas al calendario — una por marca para mantener payloads pequeños (~20KB c/u)
-# Nunca se tocan desde crons/webhook
+# Tareas legacy del calendario — UNA por marca, con hasta 3 meses adentro de un
+# solo campo description. Formato viejo: se mantienen solo como fuente de migración
+# perezosa (ver _brand_month_task) y como fallback del redirect de /calendar sin
+# ?month=. El almacenamiento activo es CALENDAR_MONTH_REGISTRY_TASK_ID + una tarea
+# por (marca, mes) — ver más abajo.
 CALENDAR_TASK_ID        = '86ahv938h'   # tarea legacy / fallback
 CALENDAR_BACKUP_TASK_ID = '86ahva45t'   # backup de la tarea legacy
 CALENDAR_BRAND_TASKS = {
@@ -726,6 +729,14 @@ CALENDAR_BRAND_TASKS = {
     'BHU':     '86ahvcpcx',
 }
 BRANDS_CONFIG_TASK_ID = '86ahyrq9c'   # config dinámica de marcas [NO BORRAR]
+
+CALENDAR_LIST_ID = '901326439751'   # lista de ClickUp donde viven todas las tareas de calendario
+# Mapea {brand: {month_str: task_id}} — una tarea de ClickUp por (marca, mes), en vez
+# de una tarea por marca con varios meses adentro. Antes, guardar UN post de octubre
+# reescribía también septiembre y noviembre enteros (todo vivía en el mismo campo de
+# texto) — eso era la causa real de la lentitud al guardar, no la cantidad de llamadas
+# HTTP. Con esto, guardar un post de un mes solo lee/escribe la tarea de ESE mes.
+CALENDAR_MONTH_REGISTRY_TASK_ID = '17tjyy3ha8e'   # [NO BORRAR]
 
 # Config inicial de marcas hardcodeada como fallback — se migra a ClickUp en primera carga
 _BRANDS_DEFAULT = {
@@ -786,10 +797,12 @@ def save_state(state):
     cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': _encode_for_clickup(state)})
 
 def _brand_task(brand):
-    """Devuelve el task_id de ClickUp para una marca.
-    Marcas hardcodeadas → dict en memoria. Marcas creadas dinámicamente → config en ClickUp
-    (necesario porque en un cold start de Vercel CALENDAR_BRAND_TASKS no las tiene).
-    Fallback final: tarea legacy."""
+    """Devuelve el task_id de la tarea LEGACY (formato viejo, varios meses en un
+    campo) de una marca. Marcas hardcodeadas → dict en memoria. Marcas creadas
+    dinámicamente → config en ClickUp (necesario porque en un cold start de Vercel
+    CALENDAR_BRAND_TASKS no las tiene). Fallback final: tarea legacy genérica.
+    Solo se usa hoy para migración perezosa y para el fallback del redirect de
+    /calendar — el almacenamiento activo es _brand_month_task()."""
     if brand in CALENDAR_BRAND_TASKS:
         return CALENDAR_BRAND_TASKS[brand]
     try:
@@ -802,17 +815,122 @@ def _brand_task(brand):
         print(f'_brand_task config lookup {brand}: {e}')
     return CALENDAR_TASK_ID
 
-def read_calendar_brand(brand, month_str=None):
-    """Lee los posts de UNA marca desde su tarea dedicada. Rápido (~15KB por marca).
+# --- Registro (marca, mes) -> task_id ---------------------------------------
+# Caché corta en memoria: se lee en casi cada operación de calendario, pero
+# cambia poco de invocación a invocación (solo cuando se toca un mes por
+# primera vez), así que amerita el mismo patrón que _brands_config_cache.
+_month_registry_cache = {'data': None, 'ts': 0}
+_MONTH_REGISTRY_TTL = 30  # segundos — corto porque se escribe seguido (cada mes nuevo)
+
+def _read_month_registry():
+    now = datetime.utcnow().timestamp()
+    if _month_registry_cache['data'] is not None and now - _month_registry_cache['ts'] < _MONTH_REGISTRY_TTL:
+        return _month_registry_cache['data']
+    try:
+        task = cu_get(f'task/{CALENDAR_MONTH_REGISTRY_TASK_ID}')
+        data = _decode_task_desc(task.get('description', '') or '')
+        if not isinstance(data, dict):
+            data = {}
+    except Exception as e:
+        print(f'_read_month_registry: {e}')
+        data = _month_registry_cache['data'] if _month_registry_cache['data'] is not None else {}
+    _month_registry_cache['data'] = data
+    _month_registry_cache['ts'] = now
+    return data
+
+def _register_month_task(brand, month_str, task_id):
+    """Agrega (marca, mes) -> task_id al registro. Relee el registro fresco antes
+    de escribir (en vez de reusar la caché) para minimizar la ventana de carrera
+    con otra invocación de Vercel registrando un mes distinto al mismo tiempo —
+    no es una garantía atómica, pero en el peor caso solo se pierde el registro de
+    una tarea recién creada (se re-crea sola la próxima vez que se pida ese mes)."""
+    try:
+        task = cu_get(f'task/{CALENDAR_MONTH_REGISTRY_TASK_ID}')
+        registry = _decode_task_desc(task.get('description', '') or '')
+        if not isinstance(registry, dict):
+            registry = {}
+    except Exception:
+        registry = dict(_month_registry_cache['data'] or {})
+    registry.setdefault(brand, {})[month_str] = task_id
+    cu_put(f'task/{CALENDAR_MONTH_REGISTRY_TASK_ID}', {'markdown_description': _encode_for_clickup(registry)})
+    _month_registry_cache['data'] = registry
+    _month_registry_cache['ts'] = datetime.utcnow().timestamp()
+
+def _create_month_task(brand, month_str, posts):
+    """Crea la tarea dedicada a (marca, mes) en ClickUp con los posts dados."""
+    res = cu_post(f'list/{CALENDAR_LIST_ID}/task', {
+        'name': f'📅 Cal-{brand}-{month_str} [NO BORRAR]',
+        'description': 'Calendario generado automáticamente.',
+    })
+    task_id = res.get('id') or res.get('task_id', '')
+    if not task_id:
+        raise RuntimeError(f'No se pudo crear la tarea de {brand}/{month_str} en ClickUp')
+    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(posts)})
+    return task_id
+
+def _legacy_brand_months(brand):
+    """Devuelve el set de meses con contenido en la tarea LEGACY de la marca
+    (formato viejo, varios meses en un campo). Se usa solo para el redirect de
+    /calendar sin ?month= y para la migración perezosa de _brand_month_task."""
+    try:
+        task = cu_get(f'task/{_brand_task(brand)}')
+        data = _decode_task_desc(task.get('description', '') or '')
+        return {m for m, posts in data.items() if posts} if isinstance(data, dict) else set()
+    except Exception as e:
+        print(f'_legacy_brand_months {brand}: {e}')
+        return set()
+
+def _brand_month_task(brand, month_str, create_if_missing=False):
+    """Devuelve el task_id de ClickUp dedicado a (marca, mes) — una tarea por mes,
+    no por marca. Antes, guardar UN post reescribía el calendario ENTERO de la
+    marca (hasta 3 meses juntos en un campo de texto); ahora cada mes vive en su
+    propia tarea, así que un guardado solo mueve los datos de ESE mes.
+
+    Migra sola, de forma perezosa: si (marca, mes) no está en el registro pero la
+    tarea legacy de la marca tiene datos de ese mes, los migra a una tarea nueva la
+    primera vez que se piden. Si tampoco hay nada ahí y create_if_missing=False,
+    devuelve None (mes sin contenido — no crear tareas vacías solo por mirar un
+    mes)."""
+    registry = _read_month_registry()
+    task_id = registry.get(brand, {}).get(month_str)
+    if task_id:
+        return task_id
+
+    legacy_posts = None
+    try:
+        legacy_task = cu_get(f'task/{_brand_task(brand)}')
+        legacy_data = _decode_task_desc(legacy_task.get('description', '') or '')
+        if isinstance(legacy_data, dict):
+            legacy_posts = legacy_data.get(month_str)
+    except Exception as e:
+        print(f'_brand_month_task migración legacy {brand}/{month_str}: {e}')
+
+    if legacy_posts:
+        new_task_id = _create_month_task(brand, month_str, legacy_posts)
+        _register_month_task(brand, month_str, new_task_id)
+        return new_task_id
+
+    if not create_if_missing:
+        return None
+
+    new_task_id = _create_month_task(brand, month_str, [])
+    _register_month_task(brand, month_str, new_task_id)
+    return new_task_id
+
+def read_calendar_brand(brand, month_str):
+    """Lee los posts de UNA marca para UN mes, desde la tarea dedicada a (marca, mes).
+    Payload chico (solo ese mes) → rápido y sin timeouts.
 
     IMPORTANTE: ante un fallo (timeout, rate limit de ClickUp, etc.) reintenta una
     vez y, si igual falla, LEVANTA la excepción en vez de devolver vacío.
-    Devolver {} / [] en un error se confunde con "no hay contenido este mes" —
-    y varios endpoints de guardado (save/delete/regenerate) usan ese resultado
-    para reescribir la tarea completa, lo que podía borrar meses enteros en
-    ClickUp con un simple error de red pasajero. Cada caller ya maneja la
-    excepción (o la deja fallar limpio con 500) en vez de guardar datos vacíos."""
-    task_id = _brand_task(brand)
+    Devolver [] en un error se confunde con "no hay contenido este mes" — y varios
+    endpoints de guardado (save/delete/regenerate) usan ese resultado para
+    reescribir la tarea, lo que podía borrar el mes con un simple error de red
+    pasajero. Cada caller ya maneja la excepción (o la deja fallar limpio con 500)
+    en vez de guardar datos vacíos."""
+    task_id = _brand_month_task(brand, month_str, create_if_missing=False)
+    if not task_id:
+        return []   # nada registrado y nada en la tarea legacy: mes sin contenido
     last_err = None
     # Un solo nivel de reintento: cu_get() ya reintenta una vez internamente
     # (http_req retries=1), así que envolverlo en OTRO loop de reintento
@@ -824,64 +942,32 @@ def read_calendar_brand(brand, month_str=None):
             task = http_req(f'https://api.clickup.com/api/v2/task/{task_id}',
                              headers={'Authorization': CLICKUP_TOKEN})
             data = _decode_task_desc(task.get('description', '') or '')
-            if month_str:
-                return data.get(month_str, [])
-            return data   # {month_str: [posts]}
+            return data if isinstance(data, list) else []
         except Exception as e:
             last_err = e
             if attempt == 0:
                 time.sleep(0.5)
-    print(f'read_calendar_brand {brand} falló tras reintento: {last_err}')
+    print(f'read_calendar_brand {brand}/{month_str} falló tras reintento: {last_err}')
     raise RuntimeError(f'No se pudo leer el calendario de {brand}: {last_err}')
 
-def _write_calendar_brand(brand, current):
-    """Escribe el dict completo {month_str: [posts]} de una marca en su tarea,
-    SIN leer antes — usar cuando el caller ya tiene el estado actual (por ej.
-    recién obtenido con read_calendar_brand) para no duplicar el GET."""
-    task_id = _brand_task(brand)
-    # Mantener máximo 3 meses por marca
-    months = sorted(current.keys())
-    if len(months) > 3:
-        for old in months[:-3]:
-            del current[old]
-    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(current)})
-
 def save_calendar_brand(brand, month_str, posts):
-    """Escribe los posts de UNA marca en su tarea dedicada.
-    Payload pequeño (~15KB) → rápido y sin timeouts."""
-    task_id = _brand_task(brand)
-    # Leer el estado actual de esa marca para no perder otros meses
-    try:
-        task = cu_get(f'task/{task_id}')
-        current = _decode_task_desc(task.get('description', '') or '')
-    except Exception:
-        current = {}
-    current[month_str] = posts
-    _write_calendar_brand(brand, current)
+    """Escribe los posts de UN mes de UNA marca en su tarea dedicada a (marca, mes).
+    Ya no lee ni reescribe otros meses — antes esto reescribía el calendario ENTERO
+    de la marca (hasta 3 meses) en cada guardado, sin importar que hubieras tocado
+    un solo post; esa reescritura del blob completo era la causa real de la
+    lentitud al guardar, más allá de cuántas llamadas HTTP se hicieran."""
+    task_id = _brand_month_task(brand, month_str, create_if_missing=True)
+    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(posts)})
 
 def _update_calendar_brand_month(brand, month_str, mutate_fn):
-    """Lee la tarea de la marca UNA sola vez, aplica mutate_fn a la lista de posts
-    del mes indicado y escribe UNA sola vez. save/delete individuales hacían un
-    read_calendar_brand() + save_calendar_brand() que entre los dos terminaban
-    pegándole 2 GET + 1 PUT a ClickUp para una sola edición — con ClickUp lento
-    eso solo ya superaba el timeout de 25s del cliente. Con esto queda en 1 GET + 1 PUT."""
-    brand_data = read_calendar_brand(brand)   # {month_str: [posts]} — 1 GET
-    posts_list = mutate_fn(brand_data.get(month_str, []))
-    brand_data[month_str] = posts_list
-    _write_calendar_brand(brand, brand_data)  # 1 PUT
+    """Lee el mes UNA sola vez, aplica mutate_fn a la lista de posts y escribe UNA
+    sola vez — ambas operaciones tocan solo la tarea de (marca, mes), nunca otros
+    meses. 1 GET + 1 PUT en total (2 si hay que migrar/crear la tarea la primera
+    vez que se toca ese mes)."""
+    posts_list = read_calendar_brand(brand, month_str)
+    posts_list = mutate_fn(posts_list)
+    save_calendar_brand(brand, month_str, posts_list)
     return posts_list
-
-def read_calendar():
-    """Lee el calendario completo (todas las marcas) para /calendar/data.
-    Hace una llamada por marca — se usa solo en carga de página."""
-    result = {}
-    for brand in get_all_brand_tasks():
-        try:
-            data = read_calendar_brand(brand)
-            result[brand] = data   # {month_str: [posts]}
-        except Exception:
-            pass
-    return result
 
 def save_calendar(calendar_data, backup=False):
     """Compatibilidad con replace-brand: calendar_data = {month_str: {brand: [posts]}}.
@@ -2809,14 +2895,13 @@ def check_new_posts(state):
 
 # ─── CALENDAR HELPERS ──────────────────────────────────────────────────────────
 
-def read_brands_parallel(brands, month_str=None):
-    """Lee varias marcas en paralelo desde ClickUp (en vez de una por una).
-    Es la causa principal de la lentitud al navegar entre meses: antes eran
+def read_brands_parallel(brands, month_str):
+    """Lee varias marcas en paralelo, para UN mes, desde ClickUp (en vez de una por
+    una). Es la causa principal de la lentitud al navegar entre meses: antes eran
     N llamadas HTTP secuenciales a ClickUp, ahora corren todas al mismo tiempo.
-    Devuelve (results, failed): results es {brand: data} solo con las marcas
-    que se pudieron leer (data es [posts] si se pasó month_str, o
-    {month_str: [posts]} si no) y failed es la lista de marcas que fallaron
-    (para NO confundirlas con "sin contenido este mes")."""
+    Devuelve (results, failed): results es {brand: [posts]} solo con las marcas
+    que se pudieron leer y failed es la lista de marcas que fallaron (para NO
+    confundirlas con "sin contenido este mes")."""
     results = {}
     failed = []
     brands = list(brands)
@@ -2833,23 +2918,16 @@ def read_brands_parallel(brands, month_str=None):
                 failed.append(b)
     return results, failed
 
-def get_calendar_data(month_str=None):
-    """Lee datos del calendario (todas las marcas) desde las tareas dedicadas, en paralelo.
-    Devuelve {brand: [posts]} para un mes, o {month: {brand: [posts]}} sin mes.
-    Si alguna marca falló al leer, se omite del resultado (no se confunde con
-    vacío) y queda logueado — este helper se usa solo para conteos informativos,
-    no para guardar nada."""
+def get_calendar_data(month_str):
+    """Lee datos del calendario (todas las marcas) para UN mes, en paralelo.
+    Devuelve {brand: [posts]}. Si alguna marca falló al leer, se omite del
+    resultado (no se confunde con vacío) y queda logueado — este helper se usa
+    solo para conteos informativos, no para guardar nada."""
     try:
         brand_results, failed = read_brands_parallel(get_all_brand_tasks().keys(), month_str)
         if failed:
             print(f'get_calendar_data: marcas con error de lectura: {failed}')
-        if month_str:
-            return {b: posts for b, posts in brand_results.items() if posts}
-        brands_data = {}
-        for brand, brand_months in brand_results.items():
-            for m, posts in brand_months.items():
-                brands_data.setdefault(m, {})[brand] = posts
-        return brands_data
+        return {b: posts for b, posts in brand_results.items() if posts}
     except Exception as e:
         print(f'Cal get error: {e}')
         return {}
@@ -4516,7 +4594,7 @@ def calendar_generate():
             year, mo = int(month_str[:4]), int(month_str[5:])
             posting_dates = get_posting_dates(year, mo)
             assignments   = assign_formats(brands, posting_dates)
-            calendar_data = read_calendar().get(month_str) or {}
+            calendar_data = get_calendar_data(month_str) or {}
 
             slots = [(d, brands_day[brand]) for d, brands_day in sorted(assignments.items()) if brand in brands_day]
             social   = generate_social_posts(brand, month_label, slots)
@@ -4662,8 +4740,8 @@ def calendar_brands_post():
     if name in cfg:
         return jsonify({'ok': False, 'error': f'La marca "{name}" ya existe'}), 409
 
-    # Crear tarea ClickUp para el calendario de esta marca
-    CALENDAR_LIST_ID = '901326439751'
+    # Crear tarea legacy para la marca (placeholder — el contenido real se guarda
+    # ya particionado por mes en cuanto se toque algún mes vía save_calendar_brand)
     try:
         res = cu_post(f'list/{CALENDAR_LIST_ID}/task', {
             'name': f'📅 Cal-{name} [NO BORRAR]',
@@ -4711,13 +4789,24 @@ def calendar_page():
     if not request.args.get('month'):
         from flask import redirect
         today = dt.date.today()
-        # Leer todas las marcas en paralelo en lugar de una por una
+        # El registro (marca,mes)->task_id ya dice qué meses tienen tarea propia,
+        # sin pegarle a ClickUp. Solo se hace el barrido legacy (más lento) para
+        # las marcas que todavía no tienen NINGÚN mes registrado — una vez que se
+        # tocó al menos un mes de cada marca desde este cambio, este bloque no
+        # vuelve a pedirle nada a ClickUp.
+        registry = _read_month_registry()
         months_with_data = set()
-        brands_data_all, _failed = read_brands_parallel(get_all_brand_tasks().keys())
-        for brand_data in brands_data_all.values():
-            for ms, posts in (brand_data or {}).items():
-                if posts:
-                    months_with_data.add(ms)
+        for brand_months in registry.values():
+            months_with_data.update(brand_months.keys())
+        brands_sin_registrar = [b for b in get_all_brand_tasks() if b not in registry]
+        if brands_sin_registrar:
+            with ThreadPoolExecutor(max_workers=min(8, len(brands_sin_registrar))) as ex:
+                futs = {ex.submit(_legacy_brand_months, b): b for b in brands_sin_registrar}
+                for fut in as_completed(futs):
+                    try:
+                        months_with_data.update(fut.result())
+                    except Exception:
+                        pass
         for delta in range(0, 7):
             d = today.replace(day=1) + dt.timedelta(days=32 * delta)
             ms = f'{d.year}-{str(d.month).zfill(2)}'
@@ -4774,8 +4863,11 @@ def calendar_save_route():
     brand = post.get('brand', '')
     if not brand:
         return Response('Bad request — falta brand en el post', status=400)
+    t0 = time.time()
     try:
-        # 1 GET + 1 PUT a la tarea de esa marca (payload ~15KB en lugar de 107KB)
+        # 1 GET + 1 PUT a la tarea de (marca, mes) — ya no al calendario entero
+        # de la marca. Timings logueados para poder diagnosticar sin depender de
+        # que alguien inspeccione la red a mano.
         def _apply(posts_list):
             idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
             if idx >= 0:
@@ -4785,9 +4877,10 @@ def calendar_save_route():
             return posts_list
         _update_calendar_brand_month(brand, month_str, _apply)
     except Exception as e:
-        print(f'calendar_save_route error: {e}')
+        print(f'calendar_save_route error ({brand}/{month_str}, {time.time()-t0:.2f}s): {e}')
         return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
                         status=500, mimetype='application/json')
+    print(f'calendar_save_route OK {brand}/{month_str} en {time.time()-t0:.2f}s')
     return Response('OK', status=200)
 
 @app.route('/calendar/check-toggle', methods=['POST'])
