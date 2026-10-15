@@ -3993,6 +3993,9 @@ def cron_check_validar():
 
 @app.route('/cron/check-posts', methods=['GET', 'POST'])
 def cron_check_posts():
+    # Pausado: Sofía posta ella misma ahora, no hace falta la notificación de Telegram.
+    # Para reactivar, descomentar el bloque de abajo.
+    return Response('OK (paused)', status=200)
     try:
         state = read_state()
         state = check_new_posts(state)
