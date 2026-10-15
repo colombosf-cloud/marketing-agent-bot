@@ -1,4 +1,4 @@
-import json, os, re, csv, tempfile, base64
+import json, os, re, csv, tempfile, base64, time, gzip
 import urllib.request, urllib.error, urllib.parse
 from datetime import datetime
 import datetime as dt
@@ -12,6 +12,12 @@ TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 CLICKUP_TOKEN = os.environ['CLICKUP_TOKEN']
 META_TOKEN = os.environ['META_TOKEN']
 ANTHROPIC_KEY = os.environ['ANTHROPIC_API_KEY']
+# Publicador automático EBDS (System User separado — no toca META_TOKEN existente)
+META_PUBLISH_TOKEN = os.environ.get('META_PUBLISH_TOKEN', '')
+ZOHO_WORKDRIVE_CLIENT_ID     = os.environ.get('ZOHO_WORKDRIVE_CLIENT_ID', '')
+ZOHO_WORKDRIVE_CLIENT_SECRET = os.environ.get('ZOHO_WORKDRIVE_CLIENT_SECRET', '')
+ZOHO_WORKDRIVE_REFRESH_TOKEN = os.environ.get('ZOHO_WORKDRIVE_REFRESH_TOKEN', '')
+MEDIA_PROXY_SECRET = os.environ.get('MEDIA_PROXY_SECRET', '')
 ZOHO_CLIENT_ID     = os.environ.get('ZOHO_CLIENT_ID', '')
 ZOHO_CLIENT_SECRET = os.environ.get('ZOHO_CLIENT_SECRET', '')
 ZOHO_REFRESH_TOKEN = os.environ.get('ZOHO_REFRESH_TOKEN', '')
@@ -35,7 +41,8 @@ CLIENTS = {
     'pedia':     {'name': 'Pediapartner', 'meta': 'act_882383240407303', 'done': 'done'},
     'tivenos':  {'name': 'Tivenos', 'list_id': '901324496237', 'done': 'done'},
     'sibila':   {'name': 'Sibila',  'list_id': '901324495956', 'done': 'done'},
-    'zoweare':  {'name': 'ZoWeAre', 'done': 'done'},
+    'zoweare':  {'name': 'ZoWeAre', 'list_id': '901324494454', 'done': 'done'},
+    'heycourse': {'name': 'HeyCourse', 'list_id': '901716918882', 'done': 'complete'},
 }
 
 CAMPAIGN_CLIENTS = {
@@ -61,20 +68,34 @@ COUNTRY_CODES = {
 }
 
 WORKSPACES = {
-    '90132956644': {'name': 'BHU',     'done': 'hecho'},
-    '90132956682': {'name': 'EBDS',    'done': 'done'},
-    '90131113078': {'name': 'Tivenos', 'done': 'done'},
-    '90132956656': {'name': 'Sibila',  'done': 'done'},
-    '90132956693': {'name': 'ZoWeAre', 'done': 'done'},
+    '90132956644': {'name': 'BHU',       'done': 'hecho'},
+    '90132956682': {'name': 'EBDS',      'done': 'done'},
+    '90131113078': {'name': 'Tivenos',   'done': 'done'},
+    '90132956656': {'name': 'Sibila',    'done': 'done'},
+    '90132956693': {'name': 'ZoWeAre',   'done': 'done'},
+    '90171526256': {'name': 'HeyCourse', 'done': 'complete'},
 }
 
 # --- HTTP helpers ---
-def http_req(url, method='GET', data=None, headers=None):
+def http_req(url, method='GET', data=None, headers=None, retries=0, retry_delay=0.6):
+    """retries>0 reintenta ante timeouts/errores de red antes de levantar la
+    excepción. Solo se usa para GET/PUT (idempotentes — repetirlos no duplica
+    nada). Nunca se usa para POST (crear tarea/comentario), porque si el POST
+    ya llegó a destino y solo se perdió la respuesta, reintentarlo crearía
+    un duplicado."""
     h = {'Content-Type': 'application/json', **(headers or {})}
     body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(url, data=body, headers=h, method=method)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read())
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, data=body, headers=h, method=method)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(retry_delay)
+    raise last_err
 
 def tg_send(text):
     http_req(
@@ -99,13 +120,15 @@ def tg_send_document(filepath, filename, caption='', mimetype='text/csv'):
         return json.loads(r.read())
 
 def cu_get(path):
-    return http_req(f'https://api.clickup.com/api/v2/{path}', headers={'Authorization': CLICKUP_TOKEN})
+    return http_req(f'https://api.clickup.com/api/v2/{path}', headers={'Authorization': CLICKUP_TOKEN}, retries=1)
 
 def cu_post(path, data):
+    # Sin retry: un POST crea algo (tarea, comentario). Si el timeout ocurre
+    # después de que ClickUp ya procesó el request, reintentar duplicaría.
     return http_req(f'https://api.clickup.com/api/v2/{path}', 'POST', data, {'Authorization': CLICKUP_TOKEN})
 
 def cu_put(path, data):
-    return http_req(f'https://api.clickup.com/api/v2/{path}', 'PUT', data, {'Authorization': CLICKUP_TOKEN})
+    return http_req(f'https://api.clickup.com/api/v2/{path}', 'PUT', data, {'Authorization': CLICKUP_TOKEN}, retries=1)
 
 # --- Zoho CRM ---
 _zoho_tokens = {'bhu': {'token': '', 'expires': 0}, 'ebds': {'token': '', 'expires': 0}}
@@ -154,6 +177,264 @@ def _zoho_get_all(module, params, client='bhu', max_pages=10):
         if not info.get('more_records', False) or len(batch) < 200:
             break
     return all_data
+
+# --- Zoho WorkDrive (assets del calendario de contenido) ---
+# Datacenter global (.com) — cuenta marketing@behind-u.net, distinta de ZOHO_EBDS_* (CRM, .eu)
+WORKDRIVE_ROOT_FOLDER_ID = 'ap7j2be1143b53fc54e9280b66f2e8b3c6474'  # carpeta "2026"
+MESES_ES = ['ENERO','FEBRERO','MARZO','ABRIL','MAYO','JUNIO','JULIO','AGOSTO',
+            'SEPTIEMBRE','OCTUBRE','NOVIEMBRE','DICIEMBRE']
+_workdrive_token = {'token': '', 'expires': 0}
+
+def workdrive_get_token():
+    now = datetime.utcnow().timestamp()
+    if _workdrive_token['token'] and now < _workdrive_token['expires']:
+        return _workdrive_token['token']
+    params = urllib.parse.urlencode({
+        'grant_type': 'refresh_token',
+        'client_id': ZOHO_WORKDRIVE_CLIENT_ID,
+        'client_secret': ZOHO_WORKDRIVE_CLIENT_SECRET,
+        'refresh_token': ZOHO_WORKDRIVE_REFRESH_TOKEN,
+    })
+    req = urllib.request.Request(f'https://accounts.zoho.com/oauth/v2/token?{params}', data=b'', method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise Exception(f'Zoho WorkDrive token {e.code}: {e.read().decode("utf-8", "replace")}')
+    token = resp.get('access_token', '')
+    _workdrive_token['token'] = token
+    _workdrive_token['expires'] = now + 3300
+    return token
+
+def workdrive_list(folder_id):
+    """Lista los archivos/carpetas dentro de una carpeta de WorkDrive."""
+    token = workdrive_get_token()
+    req = urllib.request.Request(
+        f'https://www.zohoapis.com/workdrive/api/v1/files/{folder_id}/files',
+        headers={'Authorization': f'Zoho-oauthtoken {token}', 'Accept': 'application/vnd.api+json'})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise Exception(f'WorkDrive list {e.code} (folder {folder_id}): {e.read().decode("utf-8", "replace")}')
+    return data.get('data', [])
+
+def workdrive_download(file_id):
+    """Descarga el contenido binario de un archivo de WorkDrive. Devuelve (bytes, content_type)."""
+    token = workdrive_get_token()
+    req = urllib.request.Request(
+        f'https://www.zohoapis.com/workdrive/api/v1/download/{file_id}',
+        headers={'Authorization': f'Zoho-oauthtoken {token}'})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read(), r.headers.get('Content-Type', 'application/octet-stream')
+    except urllib.error.HTTPError as e:
+        raise Exception(f'WorkDrive download {e.code} (file {file_id}): {e.read().decode("utf-8", "replace")}')
+
+def workdrive_find_post_asset(date_str, post_type):
+    """Busca en WorkDrive (2026/MES/) la carpeta o archivo que empieza con '{date_str}_{post_type}'.
+    Devuelve una lista de file_ids en orden (varios para Carrusel, uno para el resto). [] si no hay match."""
+    year, month, _day = date_str.split('-')
+    mes_name = MESES_ES[int(month) - 1]
+    year_items = workdrive_list(WORKDRIVE_ROOT_FOLDER_ID)
+    mes_folder = next((i for i in year_items if i['attributes']['name'].strip().upper() == mes_name), None)
+    if not mes_folder:
+        return []
+    mes_items = workdrive_list(mes_folder['id'])
+    prefix = f'{date_str}_{post_type}'
+    matches = [i for i in mes_items if i['attributes']['name'].startswith(prefix)]
+    if not matches:
+        return []
+    target = matches[0]
+    if target['attributes'].get('is_folder'):
+        files = [f for f in workdrive_list(target['id']) if not f['attributes'].get('is_folder')]
+        files.sort(key=lambda f: f['attributes']['name'])
+        if post_type != 'Carrusel' and len(files) > 1:
+            # La carpeta puede traer, además del asset pedido, el de otro formato del mismo día
+            # (ej: Post + Historia juntos) — filtramos por palabras clave del nombre de archivo.
+            OTHER_HINTS = {
+                'Post':    ['historia', 'story', 'reel'],
+                'Reel':    ['historia', 'story', 'post'],
+                'Story':   ['post', 'reel'],
+                'LinkedIn': ['historia', 'story', 'reel', 'post'],
+            }
+            own_hints = {'Story': ['historia', 'story'], 'Reel': ['reel']}.get(post_type, [])
+            hints = OTHER_HINTS.get(post_type, [])
+            preferred = [f for f in files if any(h in f['attributes']['name'].lower() for h in own_hints)] if own_hints else []
+            if not preferred:
+                preferred = [f for f in files if not any(h in f['attributes']['name'].lower() for h in hints)]
+            if preferred:
+                files = preferred
+        return [f['id'] for f in files]
+    return [target['id']]
+
+def media_proxy_url(file_id):
+    """URL pública (vía nuestro propio proxy) que Meta puede usar para leer un asset de WorkDrive."""
+    base = request.url_root.rstrip('/')
+    return f'{base}/media-proxy/{file_id}?t={MEDIA_PROXY_SECRET}'
+
+
+# --- Publicador Meta (Facebook + Instagram) ---
+GRAPH = 'https://graph.facebook.com/v21.0'
+
+def _graph_post(path, params):
+    """POST a la Graph API con los parámetros en el query string (formato que espera Meta)."""
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f'{GRAPH}/{path}?{qs}', data=b'', method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        raise Exception(f'Graph API {e.code} en {path}: {body}')
+
+_page_token_cache = {}
+
+def get_page_access_token(page_id):
+    """Publicar en una Página de Facebook requiere un Page Access Token propio de esa página,
+    no el token del System User directamente — se obtiene intercambiándolo una vez."""
+    if page_id in _page_token_cache:
+        return _page_token_cache[page_id]
+    resp = _graph_post_as_get(f'{page_id}', {'fields': 'access_token', 'access_token': META_PUBLISH_TOKEN})
+    token = resp.get('access_token')
+    if not token:
+        raise Exception(f'No se pudo obtener el Page Access Token de {page_id}: {resp}')
+    _page_token_cache[page_id] = token
+    return token
+
+def _graph_post_as_get(path, params):
+    """GET a la Graph API (para endpoints de lectura, ej. intercambio de token de página)."""
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f'{GRAPH}/{path}?{qs}', method='GET')
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        raise Exception(f'Graph API {e.code} en GET {path}: {body}')
+
+def meta_publish_fb_photo(page_id, image_url, caption):
+    page_token = get_page_access_token(page_id)
+    return _graph_post(f'{page_id}/photos', {'url': image_url, 'caption': caption, 'access_token': page_token})
+
+def meta_ig_create_container(ig_id, media_url, caption='', media_type=None, is_carousel_item=False):
+    params = {'access_token': META_PUBLISH_TOKEN}
+    if media_type == 'REELS':
+        params.update(media_type='REELS', video_url=media_url)
+    elif media_type == 'STORIES':
+        params.update(media_type='STORIES', image_url=media_url)
+    else:
+        params['image_url'] = media_url
+    if is_carousel_item:
+        params['is_carousel_item'] = 'true'
+    elif caption:
+        params['caption'] = caption
+    resp = _graph_post(f'{ig_id}/media', params)
+    if 'id' not in resp:
+        raise Exception(f'IG container error: {resp}')
+    return resp['id']
+
+def meta_ig_create_carousel_container(ig_id, children_ids, caption):
+    params = {'media_type': 'CAROUSEL', 'children': ','.join(children_ids), 'caption': caption, 'access_token': META_PUBLISH_TOKEN}
+    resp = _graph_post(f'{ig_id}/media', params)
+    if 'id' not in resp:
+        raise Exception(f'IG carousel container error: {resp}')
+    return resp['id']
+
+def meta_ig_publish(ig_id, creation_id):
+    import time
+    # Reels/videos necesitan procesarse antes de poder publicarse — reintentar unos segundos.
+    for _ in range(10):
+        try:
+            return _graph_post(f'{ig_id}/media_publish', {'creation_id': creation_id, 'access_token': META_PUBLISH_TOKEN})
+        except Exception as e:
+            if 'not ready' in str(e).lower() or '"code":9007' in str(e).replace(' ', ''):
+                time.sleep(3)
+                continue
+            raise
+    raise Exception('IG publish: media no quedó lista a tiempo')
+
+def publish_post_to_meta(brand_client, post):
+    """Publica UN post (dict del calendario) en Meta/Instagram según su 'type'. Devuelve dict con resultado."""
+    acc = next((a for a in SOCIAL_ACCOUNTS if a['client'] == brand_client), None)
+    if not acc:
+        raise Exception(f'No hay SOCIAL_ACCOUNTS configurado para {brand_client}')
+    file_ids = workdrive_find_post_asset(post['date'], post['type'])
+    if not file_ids:
+        raise Exception(f"No se encontró el asset en WorkDrive para {post['date']}_{post['type']}")
+    caption = (post.get('copy') or '') + (('\n\n' + post['hashtags']) if post.get('hashtags') else '')
+    ptype = post['type']
+    result = {}
+
+    if ptype == 'Post':
+        url = media_proxy_url(file_ids[0])
+        result['facebook'] = meta_publish_fb_photo(acc['fb'], url, caption)
+        cid = meta_ig_create_container(acc['ig'], url, caption)
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    elif ptype == 'Carrusel':
+        children = [meta_ig_create_container(acc['ig'], media_proxy_url(fid), is_carousel_item=True) for fid in file_ids]
+        cid = meta_ig_create_carousel_container(acc['ig'], children, caption)
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    elif ptype == 'Reel':
+        url = media_proxy_url(file_ids[0])
+        cid = meta_ig_create_container(acc['ig'], url, caption, media_type='REELS')
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    elif ptype == 'Story':
+        url = media_proxy_url(file_ids[0])
+        cid = meta_ig_create_container(acc['ig'], url, media_type='STORIES')
+        result['instagram'] = meta_ig_publish(acc['ig'], cid)
+
+    else:
+        raise Exception(f"Tipo '{ptype}' no soportado por el publicador automático todavía")
+
+    return result
+
+def _safe_tg_send(text):
+    """Como tg_send, pero nunca revienta el flujo que la llama: si Telegram rechaza el
+    Markdown (común con textos de error que traen JSON crudo con _ * [ ] etc.), reintenta
+    en texto plano; si eso también falla, solo lo logueamos."""
+    try:
+        tg_send(text)
+    except Exception:
+        try:
+            http_req(
+                f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                'POST', {'chat_id': SOFIA_CHAT_ID, 'text': text}
+            )
+        except Exception as e2:
+            print(f'_safe_tg_send: no se pudo notificar ({e2}): {text[:200]}')
+
+def publish_scheduled_posts(brands=('EBDS',)):
+    """Cron: para cada marca, busca los posts de HOY con status 'aprobado' y los publica.
+    Marca cada post publicado con post['_published']=True (para no publicarlo dos veces)."""
+    today = dt.date.today().isoformat()
+    month_str = today[:7]
+    for brand in brands:
+        try:
+            posts = read_calendar_brand(brand, month_str)
+        except Exception as e:
+            _safe_tg_send(f'⚠️ Publicador: error leyendo calendario de {brand}: {e}')
+            continue
+        changed = False
+        for post in posts:
+            if post.get('date') != today or post.get('status') != 'aprobado' or post.get('_published'):
+                continue
+            try:
+                publish_post_to_meta(brand, post)
+                post['_published'] = True
+                changed = True
+                _safe_tg_send(f"✅ Publicado — {brand} — {post['type']} — {post.get('titulo','')}")
+            except Exception as e:
+                _safe_tg_send(f"⚠️ Error publicando {brand} — {post['type']} — {post.get('titulo','')}\n{e}")
+        if changed:
+            try:
+                save_calendar_brand(brand, month_str, posts)
+            except Exception as e:
+                print(f'publish_scheduled_posts save error {brand}: {e}')
+
 
 def zoho_crm_funnel(month_date=None):
     """
@@ -433,8 +714,11 @@ STATE_DEFAULTS = {
     'last_post_ids': {},
 }
 
-# Tareas dedicadas al calendario — una por marca para mantener payloads pequeños (~20KB c/u)
-# Nunca se tocan desde crons/webhook
+# Tareas legacy del calendario — UNA por marca, con hasta 3 meses adentro de un
+# solo campo description. Formato viejo: se mantienen solo como fuente de migración
+# perezosa (ver _brand_month_task) y como fallback del redirect de /calendar sin
+# ?month=. El almacenamiento activo es CALENDAR_MONTH_REGISTRY_TASK_ID + una tarea
+# por (marca, mes) — ver más abajo.
 CALENDAR_TASK_ID        = '86ahv938h'   # tarea legacy / fallback
 CALENDAR_BACKUP_TASK_ID = '86ahva45t'   # backup de la tarea legacy
 CALENDAR_BRAND_TASKS = {
@@ -446,6 +730,14 @@ CALENDAR_BRAND_TASKS = {
 }
 BRANDS_CONFIG_TASK_ID = '86ahyrq9c'   # config dinámica de marcas [NO BORRAR]
 
+CALENDAR_LIST_ID = '901326439751'   # lista de ClickUp donde viven todas las tareas de calendario
+# Mapea {brand: {month_str: task_id}} — una tarea de ClickUp por (marca, mes), en vez
+# de una tarea por marca con varios meses adentro. Antes, guardar UN post de octubre
+# reescribía también septiembre y noviembre enteros (todo vivía en el mismo campo de
+# texto) — eso era la causa real de la lentitud al guardar, no la cantidad de llamadas
+# HTTP. Con esto, guardar un post de un mes solo lee/escribe la tarea de ESE mes.
+CALENDAR_MONTH_REGISTRY_TASK_ID = '17tjyy3ha8e'   # [NO BORRAR]
+
 # Config inicial de marcas hardcodeada como fallback — se migra a ClickUp en primera carga
 _BRANDS_DEFAULT = {
     'EBDS':    {'color':'#1e3a8a','task_id':'86ahvcnc2'},
@@ -456,11 +748,18 @@ _BRANDS_DEFAULT = {
 }
 
 def _decode_task_desc(desc):
-    """Decodifica base64 o JSON plano desde el campo description de una tarea ClickUp."""
+    """Decodifica base64+gzip (formato actual) o base64 plano / JSON plano (formatos
+    viejos, por compatibilidad hacia atrás) desde el campo description de una tarea
+    ClickUp."""
     if not desc or not desc.strip():
         return {}
     try:
-        return json.loads(base64.b64decode(desc.strip().encode()).decode('utf-8'))
+        raw = base64.b64decode(desc.strip().encode())
+        try:
+            raw = gzip.decompress(raw)   # formato actual (comprimido)
+        except OSError:
+            pass                          # formato viejo: base64 sin comprimir
+        return json.loads(raw.decode('utf-8'))
     except Exception:
         try:
             return json.loads(desc)
@@ -468,8 +767,14 @@ def _decode_task_desc(desc):
             return {}
 
 def _encode_for_clickup(data):
-    """Serializa dict a base64 para guardar en ClickUp."""
-    return base64.b64encode(json.dumps(data, ensure_ascii=False).encode('utf-8')).decode('ascii')
+    """Serializa dict a JSON, comprime con gzip y codifica en base64 para guardar en
+    ClickUp. El calendario de una marca con 2-3 meses de posts pesa ~100KB en base64
+    sin comprimir — eso, no la cantidad de llamadas, es lo que hacía que ClickUp
+    tardara tanto en cada guardado/lectura. Con gzip (antes de base64 — comprimir
+    después no sirve, base64 ya no compacta) el payload baja ~70%, a ~30KB."""
+    raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
+    compressed = gzip.compress(raw, compresslevel=6)
+    return base64.b64encode(compressed).decode('ascii')
 
 def read_state():
     """Lee SOLO el estado del bot (last_offset, validar, etc.).
@@ -492,10 +797,12 @@ def save_state(state):
     cu_put(f'task/{STATE_TASK_ID}', {'markdown_description': _encode_for_clickup(state)})
 
 def _brand_task(brand):
-    """Devuelve el task_id de ClickUp para una marca.
-    Marcas hardcodeadas → dict en memoria. Marcas creadas dinámicamente → config en ClickUp
-    (necesario porque en un cold start de Vercel CALENDAR_BRAND_TASKS no las tiene).
-    Fallback final: tarea legacy."""
+    """Devuelve el task_id de la tarea LEGACY (formato viejo, varios meses en un
+    campo) de una marca. Marcas hardcodeadas → dict en memoria. Marcas creadas
+    dinámicamente → config en ClickUp (necesario porque en un cold start de Vercel
+    CALENDAR_BRAND_TASKS no las tiene). Fallback final: tarea legacy genérica.
+    Solo se usa hoy para migración perezosa y para el fallback del redirect de
+    /calendar — el almacenamiento activo es _brand_month_task()."""
     if brand in CALENDAR_BRAND_TASKS:
         return CALENDAR_BRAND_TASKS[brand]
     try:
@@ -508,46 +815,159 @@ def _brand_task(brand):
         print(f'_brand_task config lookup {brand}: {e}')
     return CALENDAR_TASK_ID
 
-def read_calendar_brand(brand, month_str=None):
-    """Lee los posts de UNA marca desde su tarea dedicada. Rápido (~15KB por marca)."""
+# --- Registro (marca, mes) -> task_id ---------------------------------------
+# Caché corta en memoria: se lee en casi cada operación de calendario, pero
+# cambia poco de invocación a invocación (solo cuando se toca un mes por
+# primera vez), así que amerita el mismo patrón que _brands_config_cache.
+_month_registry_cache = {'data': None, 'ts': 0}
+_MONTH_REGISTRY_TTL = 30  # segundos — corto porque se escribe seguido (cada mes nuevo)
+
+def _read_month_registry():
+    now = datetime.utcnow().timestamp()
+    if _month_registry_cache['data'] is not None and now - _month_registry_cache['ts'] < _MONTH_REGISTRY_TTL:
+        return _month_registry_cache['data']
+    try:
+        task = cu_get(f'task/{CALENDAR_MONTH_REGISTRY_TASK_ID}')
+        data = _decode_task_desc(task.get('description', '') or '')
+        if not isinstance(data, dict):
+            data = {}
+    except Exception as e:
+        print(f'_read_month_registry: {e}')
+        data = _month_registry_cache['data'] if _month_registry_cache['data'] is not None else {}
+    _month_registry_cache['data'] = data
+    _month_registry_cache['ts'] = now
+    return data
+
+def _register_month_task(brand, month_str, task_id):
+    """Agrega (marca, mes) -> task_id al registro. Relee el registro fresco antes
+    de escribir (en vez de reusar la caché) para minimizar la ventana de carrera
+    con otra invocación de Vercel registrando un mes distinto al mismo tiempo —
+    no es una garantía atómica, pero en el peor caso solo se pierde el registro de
+    una tarea recién creada (se re-crea sola la próxima vez que se pida ese mes)."""
+    try:
+        task = cu_get(f'task/{CALENDAR_MONTH_REGISTRY_TASK_ID}')
+        registry = _decode_task_desc(task.get('description', '') or '')
+        if not isinstance(registry, dict):
+            registry = {}
+    except Exception:
+        registry = dict(_month_registry_cache['data'] or {})
+    registry.setdefault(brand, {})[month_str] = task_id
+    cu_put(f'task/{CALENDAR_MONTH_REGISTRY_TASK_ID}', {'markdown_description': _encode_for_clickup(registry)})
+    _month_registry_cache['data'] = registry
+    _month_registry_cache['ts'] = datetime.utcnow().timestamp()
+
+def _create_month_task(brand, month_str, posts):
+    """Crea la tarea dedicada a (marca, mes) en ClickUp con los posts dados."""
+    res = cu_post(f'list/{CALENDAR_LIST_ID}/task', {
+        'name': f'📅 Cal-{brand}-{month_str} [NO BORRAR]',
+        'description': 'Calendario generado automáticamente.',
+    })
+    task_id = res.get('id') or res.get('task_id', '')
+    if not task_id:
+        raise RuntimeError(f'No se pudo crear la tarea de {brand}/{month_str} en ClickUp')
+    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(posts)})
+    return task_id
+
+def _legacy_brand_months(brand):
+    """Devuelve el set de meses con contenido en la tarea LEGACY de la marca
+    (formato viejo, varios meses en un campo). Se usa solo para el redirect de
+    /calendar sin ?month= y para la migración perezosa de _brand_month_task."""
     try:
         task = cu_get(f'task/{_brand_task(brand)}')
         data = _decode_task_desc(task.get('description', '') or '')
-        if month_str:
-            return data.get(month_str, [])
-        return data   # {month_str: [posts]}
-    except Exception:
-        return {} if month_str is None else []
+        return {m for m, posts in data.items() if posts} if isinstance(data, dict) else set()
+    except Exception as e:
+        print(f'_legacy_brand_months {brand}: {e}')
+        return set()
+
+def _brand_month_task(brand, month_str, create_if_missing=False):
+    """Devuelve el task_id de ClickUp dedicado a (marca, mes) — una tarea por mes,
+    no por marca. Antes, guardar UN post reescribía el calendario ENTERO de la
+    marca (hasta 3 meses juntos en un campo de texto); ahora cada mes vive en su
+    propia tarea, así que un guardado solo mueve los datos de ESE mes.
+
+    Migra sola, de forma perezosa: si (marca, mes) no está en el registro pero la
+    tarea legacy de la marca tiene datos de ese mes, los migra a una tarea nueva la
+    primera vez que se piden. Si tampoco hay nada ahí y create_if_missing=False,
+    devuelve None (mes sin contenido — no crear tareas vacías solo por mirar un
+    mes)."""
+    registry = _read_month_registry()
+    task_id = registry.get(brand, {}).get(month_str)
+    if task_id:
+        return task_id
+
+    legacy_posts = None
+    try:
+        legacy_task = cu_get(f'task/{_brand_task(brand)}')
+        legacy_data = _decode_task_desc(legacy_task.get('description', '') or '')
+        if isinstance(legacy_data, dict):
+            legacy_posts = legacy_data.get(month_str)
+    except Exception as e:
+        print(f'_brand_month_task migración legacy {brand}/{month_str}: {e}')
+
+    if legacy_posts:
+        new_task_id = _create_month_task(brand, month_str, legacy_posts)
+        _register_month_task(brand, month_str, new_task_id)
+        return new_task_id
+
+    if not create_if_missing:
+        return None
+
+    new_task_id = _create_month_task(brand, month_str, [])
+    _register_month_task(brand, month_str, new_task_id)
+    return new_task_id
+
+def read_calendar_brand(brand, month_str):
+    """Lee los posts de UNA marca para UN mes, desde la tarea dedicada a (marca, mes).
+    Payload chico (solo ese mes) → rápido y sin timeouts.
+
+    IMPORTANTE: ante un fallo (timeout, rate limit de ClickUp, etc.) reintenta una
+    vez y, si igual falla, LEVANTA la excepción en vez de devolver vacío.
+    Devolver [] en un error se confunde con "no hay contenido este mes" — y varios
+    endpoints de guardado (save/delete/regenerate) usan ese resultado para
+    reescribir la tarea, lo que podía borrar el mes con un simple error de red
+    pasajero. Cada caller ya maneja la excepción (o la deja fallar limpio con 500)
+    en vez de guardar datos vacíos."""
+    task_id = _brand_month_task(brand, month_str, create_if_missing=False)
+    if not task_id:
+        return []   # nada registrado y nada en la tarea legacy: mes sin contenido
+    last_err = None
+    # Un solo nivel de reintento: cu_get() ya reintenta una vez internamente
+    # (http_req retries=1), así que envolverlo en OTRO loop de reintento
+    # multiplicaba los intentos a 4 (hasta ~80s) — la causa de los timeouts
+    # constantes al guardar. Acá se llama a http_req() directo, sin el retry
+    # interno de cu_get, para que el único reintento sea este.
+    for attempt in range(2):
+        try:
+            task = http_req(f'https://api.clickup.com/api/v2/task/{task_id}',
+                             headers={'Authorization': CLICKUP_TOKEN})
+            data = _decode_task_desc(task.get('description', '') or '')
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(0.5)
+    print(f'read_calendar_brand {brand}/{month_str} falló tras reintento: {last_err}')
+    raise RuntimeError(f'No se pudo leer el calendario de {brand}: {last_err}')
 
 def save_calendar_brand(brand, month_str, posts):
-    """Escribe los posts de UNA marca en su tarea dedicada.
-    Payload pequeño (~15KB) → rápido y sin timeouts."""
-    task_id = _brand_task(brand)
-    # Leer el estado actual de esa marca para no perder otros meses
-    try:
-        task = cu_get(f'task/{task_id}')
-        current = _decode_task_desc(task.get('description', '') or '')
-    except Exception:
-        current = {}
-    current[month_str] = posts
-    # Mantener máximo 3 meses por marca
-    months = sorted(current.keys())
-    if len(months) > 3:
-        for old in months[:-3]:
-            del current[old]
-    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(current)})
+    """Escribe los posts de UN mes de UNA marca en su tarea dedicada a (marca, mes).
+    Ya no lee ni reescribe otros meses — antes esto reescribía el calendario ENTERO
+    de la marca (hasta 3 meses) en cada guardado, sin importar que hubieras tocado
+    un solo post; esa reescritura del blob completo era la causa real de la
+    lentitud al guardar, más allá de cuántas llamadas HTTP se hicieran."""
+    task_id = _brand_month_task(brand, month_str, create_if_missing=True)
+    cu_put(f'task/{task_id}', {'markdown_description': _encode_for_clickup(posts)})
 
-def read_calendar():
-    """Lee el calendario completo (todas las marcas) para /calendar/data.
-    Hace una llamada por marca — se usa solo en carga de página."""
-    result = {}
-    for brand in get_all_brand_tasks():
-        try:
-            data = read_calendar_brand(brand)
-            result[brand] = data   # {month_str: [posts]}
-        except Exception:
-            pass
-    return result
+def _update_calendar_brand_month(brand, month_str, mutate_fn):
+    """Lee el mes UNA sola vez, aplica mutate_fn a la lista de posts y escribe UNA
+    sola vez — ambas operaciones tocan solo la tarea de (marca, mes), nunca otros
+    meses. 1 GET + 1 PUT en total (2 si hay que migrar/crear la tarea la primera
+    vez que se toca ese mes)."""
+    posts_list = read_calendar_brand(brand, month_str)
+    posts_list = mutate_fn(posts_list)
+    save_calendar_brand(brand, month_str, posts_list)
+    return posts_list
 
 def save_calendar(calendar_data, backup=False):
     """Compatibilidad con replace-brand: calendar_data = {month_str: {brand: [posts]}}.
@@ -562,6 +982,14 @@ def save_calendar(calendar_data, backup=False):
                 print(f'save_calendar brand={brand}: {e}')
 
 # --- Brands config (dinámico) ---
+# Caché corta en memoria: la config de marcas casi no cambia, pero /calendar/data
+# la pedía 2 veces por request (una en get_calendar_data, otra en calendar_data_route)
+# sumado a una llamada más por cada _brand_task() con marca dinámica. Cachearla evita
+# llamadas redundantes a ClickUp dentro de la misma invocación (y en invocaciones
+# "calientes" de Vercel que reusan el proceso).
+_brands_config_cache = {'data': None, 'ts': 0}
+_BRANDS_CONFIG_TTL = 120  # segundos
+
 def read_brands_config():
     """Lee la config de marcas desde ClickUp. Fallback a _BRANDS_DEFAULT."""
     try:
@@ -576,13 +1004,21 @@ def read_brands_config():
 def save_brands_config(config):
     """Guarda la config de marcas en ClickUp."""
     cu_put(f'task/{BRANDS_CONFIG_TASK_ID}', {'markdown_description': _encode_for_clickup(config)})
+    _brands_config_cache['data'] = dict(config)
+    _brands_config_cache['ts'] = datetime.utcnow().timestamp()
 
 def get_brands_config():
-    """Lee config, si está vacía migra desde defaults y guarda."""
+    """Lee config (con caché corta en memoria), si está vacía migra desde defaults y guarda."""
+    now = datetime.utcnow().timestamp()
+    if _brands_config_cache['data'] is not None and now - _brands_config_cache['ts'] < _BRANDS_CONFIG_TTL:
+        return _brands_config_cache['data']
     cfg = read_brands_config()
     if not cfg:
         cfg = dict(_BRANDS_DEFAULT)
         save_brands_config(cfg)
+        return cfg
+    _brands_config_cache['data'] = cfg
+    _brands_config_cache['ts'] = now
     return cfg
 
 def get_all_brand_tasks():
@@ -2459,23 +2895,39 @@ def check_new_posts(state):
 
 # ─── CALENDAR HELPERS ──────────────────────────────────────────────────────────
 
-def get_calendar_data(month_str=None):
-    """Lee datos del calendario (todas las marcas) desde las tareas dedicadas.
-    Devuelve {brand: [posts]} para un mes, o {month: {brand: [posts]}} sin mes."""
+def read_brands_parallel(brands, month_str):
+    """Lee varias marcas en paralelo, para UN mes, desde ClickUp (en vez de una por
+    una). Es la causa principal de la lentitud al navegar entre meses: antes eran
+    N llamadas HTTP secuenciales a ClickUp, ahora corren todas al mismo tiempo.
+    Devuelve (results, failed): results es {brand: [posts]} solo con las marcas
+    que se pudieron leer y failed es la lista de marcas que fallaron (para NO
+    confundirlas con "sin contenido este mes")."""
+    results = {}
+    failed = []
+    brands = list(brands)
+    if not brands:
+        return results, failed
+    with ThreadPoolExecutor(max_workers=min(8, len(brands))) as ex:
+        futures = {ex.submit(read_calendar_brand, b, month_str): b for b in brands}
+        for fut in as_completed(futures):
+            b = futures[fut]
+            try:
+                results[b] = fut.result()
+            except Exception as e:
+                print(f'read_brands_parallel {b}: {e}')
+                failed.append(b)
+    return results, failed
+
+def get_calendar_data(month_str):
+    """Lee datos del calendario (todas las marcas) para UN mes, en paralelo.
+    Devuelve {brand: [posts]}. Si alguna marca falló al leer, se omite del
+    resultado (no se confunde con vacío) y queda logueado — este helper se usa
+    solo para conteos informativos, no para guardar nada."""
     try:
-        brands_data = {}
-        for brand in get_all_brand_tasks():
-            brand_months = read_calendar_brand(brand)  # {month_str: [posts]}
-            if month_str:
-                posts = brand_months.get(month_str, [])
-                if posts:
-                    brands_data[brand] = posts
-            else:
-                for m, posts in brand_months.items():
-                    if m not in brands_data:
-                        brands_data[m] = {}
-                    brands_data[m][brand] = posts
-        return brands_data
+        brand_results, failed = read_brands_parallel(get_all_brand_tasks().keys(), month_str)
+        if failed:
+            print(f'get_calendar_data: marcas con error de lectura: {failed}')
+        return {b: posts for b, posts in brand_results.items() if posts}
     except Exception as e:
         print(f'Cal get error: {e}')
         return {}
@@ -3171,6 +3623,7 @@ const TI={Reel:\'\\uD83C\\uDFA5\',Carrusel:\'\\uD83D\\uDCF1\',Post:\'\\uD83D\\uD
 const SC={pendiente:\'#f59e0b\',aprobado:\'#22c55e\',con_cambios:\'#ef4444\'};
 const MN=[\'Enero\',\'Febrero\',\'Marzo\',\'Abril\',\'Mayo\',\'Junio\',\'Julio\',\'Agosto\',\'Septiembre\',\'Octubre\',\'Noviembre\',\'Diciembre\'];
 let curMonth=\'\',data={},active=\'all\',curPost=null,designerChecks=new Set();
+let monthCache={}; // {month: {posts,brands,designer_checks}} — evita re-pedir a ClickUp meses ya vistos
 
 async function loadBrandsConfig(){
   try{
@@ -3199,12 +3652,54 @@ const urlM=new URLSearchParams(location.search).get(\'month\');
 const n=new Date();
 curMonth=urlM||(n.getFullYear()+\'-\'+String(n.getMonth()+1).padStart(2,\'0\'));
 
-async function load(autoAdvance){
+async function fetchMonth(m){
+  const r=await fetch(\'/calendar/data?key=\'+KEY+\'&month=\'+m);
+  return await r.json();
+}
+
+function showLoadWarning(brands,gaveUp){
+  let el=document.getElementById(\'load-warning\');
+  if(!el){
+    el=document.createElement(\'div\');
+    el.id=\'load-warning\';
+    el.style.cssText=\'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#fef3c7;color:#92400e;border:1px solid #f59e0b;padding:8px 14px;border-radius:8px;font-size:13px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,.15)\';
+    document.body.appendChild(el);
+  }
+  el.textContent=gaveUp
+    ? \'⚠️ No se pudo cargar: \'+brands.join(\', \')+\' — el contenido sigue en ClickUp, recargá la página en un momento.\'
+    : \'⚠️ No se pudo cargar: \'+brands.join(\', \')+\' — reintentando… (el contenido no se perdió)\';
+  el.style.display=\'block\';
+}
+function hideLoadWarning(){
+  const el=document.getElementById(\'load-warning\');
+  if(el)el.style.display=\'none\';
+}
+
+async function load(autoAdvance,retryCount){
+  retryCount=retryCount||0;
   try{
-    const r=await fetch(\'/calendar/data?key=\'+KEY+\'&month=\'+curMonth);
-    const d=await r.json();
+    const cached=monthCache[curMonth];
+    let d=cached;
+    if(!d){
+      d=await fetchMonth(curMonth);
+      if(d.errors&&d.errors.length){
+        // Un fallo de lectura (rate limit, timeout) NO es "mes vacío" — no se
+        // cachea ni se pinta como si no hubiera contenido, se avisa y reintenta.
+        if(retryCount<5){
+          showLoadWarning(d.errors,false);
+          setTimeout(()=>load(autoAdvance,retryCount+1),3000);
+        }else{
+          showLoadWarning(d.errors,true);
+        }
+        return;
+      }
+      hideLoadWarning();
+      monthCache[curMonth]=d;
+    }
     data=d.posts||{};
-    designerChecks=new Set(d.designer_checks||[]);
+    // El Set de checks solo se resetea en una carga fresca — si viene de caché
+    // no se toca, para no pisar toggles hechos después de que se cacheó ese mes.
+    if(!cached)designerChecks=new Set(d.designer_checks||[]);
     const total=Object.values(data).reduce((s,a)=>s+(Array.isArray(a)?a.length:0),0);
     // Si no hay datos y no se especificó mes en la URL, avanzar automáticamente al siguiente mes (una sola vez)
     if(total===0&&!autoAdvance&&!new URLSearchParams(location.search).get(\'month\')){
@@ -3215,7 +3710,26 @@ async function load(autoAdvance){
     renderCal();
     renderAgenda();
     renderExtras();
+    // Si se pintó desde caché, refrescar en segundo plano por si hubo cambios (desde el bot, otro dispositivo, etc.)
+    if(cached)refreshMonthInBackground(curMonth);
   }catch(e){console.error(e)}
+}
+
+async function refreshMonthInBackground(m){
+  try{
+    const d=await fetchMonth(m);
+    if(d.errors&&d.errors.length){
+      // No pisar los datos buenos que ya están en pantalla con un refresh fallido
+      console.warn(\'refresh en segundo plano falló para:\',d.errors);
+      return;
+    }
+    monthCache[m]=d;
+    if(m===curMonth){
+      data=d.posts||{};
+      renderTabs(d.brands||[]);
+      renderCal();renderAgenda();renderExtras();
+    }
+  }catch(e){console.warn(\'refresh bg:\',e);}
 }
 
 function renderTabs(brands){
@@ -3347,6 +3861,7 @@ function mkChip(p){
   chip.innerHTML=\'<div class="chip-dot" style="background:\'+bc+\'"></div>\'
     +\'<span class="chip-title">\'+(p.titulo||p.type)+\'</span>\'
     +\'<span class="chip-icon">\'+icon+\'</span>\'
+    +(p.diseno_link?\'<a href="\'+esc(p.diseno_link)+\'" target="_blank" rel="noopener" style="font-size:11px;padding:1px 3px;text-decoration:none" title="Ver diseño ya realizado" onclick="event.stopPropagation()">🔗</a>\':\'\')
     +\'<button class="btn-check\'+(chk?\' checked\':\'\')+\'" title="\'+(chk?\'Diseño listo ✓\':\'Marcar diseño como listo\')+\'">\'+(chk?\'✓\':\'○\')+\'</button>\'
     +\'<button class="btn-regen" style="font-size:11px;padding:1px 3px" title="Regenerar" onclick="openRegen(\'+cpKey+\',event)">🔄</button>\'
     +\'<button class="btn-del" title="Borrar" onclick="confirmDeleteChip(\'+cpKey+\',event)">✕</button>\'
@@ -3424,6 +3939,7 @@ function renderAgenda(){
         +\'<span class="agenda-brand" style="color:\'+bc+\'">\'+p.brand+\'</span>\'
         +\'<span class="agenda-title">\'+(p.titulo||\'\')+\'</span>\'
         +\'<div class="chip-status" style="background:\'+(SC[p.status]||\'#94a3b8\')+\';width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-right:4px"></div>\'
+        +(p.diseno_link?\'<a href="\'+esc(p.diseno_link)+\'" target="_blank" rel="noopener" style="font-size:14px;padding:2px 4px;flex-shrink:0;text-decoration:none" title="Ver diseño ya realizado" onclick="event.stopPropagation()">🔗</a>\':\'\')
         +\'<button class="btn-regen" style="font-size:14px;padding:2px 4px;flex-shrink:0" title="Regenerar" onclick="event.stopPropagation();openRegen(\'+pKey+\',event)">🔄</button>\';
       row.onclick=()=>openPost(p);
       block.appendChild(row);
@@ -3452,6 +3968,8 @@ function openPost(p){
     +\'<label>Pilar de contenido</label><input id="e-pilar" value="\'+esc(p.pilar||\'\')+\'">\'
     +\'<label>Objetivo</label><input id="e-objetivo" value="\'+esc(p.objetivo||\'\')+\'">\'
     +\'<label>&#127912; Texto de imagen / Descripci&oacute;n de pieza</label><textarea id="e-texto-imagen" style="min-height:90px;font-family:monospace;font-size:12px">\'+esc(p.texto_imagen||\'\')+\'</textarea>\'
+    +\'<label>&#129504; Prompt para dise&ntilde;o</label><textarea id="e-diseno-prompt" placeholder="Prompt para generar la pieza (IA de imagen, brief para diseñador, etc.)" style="min-height:70px;font-family:monospace;font-size:12px">\'+esc(p.diseno_prompt||\'\')+\'</textarea>\'
+    +\'<label>&#128279; Link del dise&ntilde;o ya realizado</label><input id="e-diseno-link" type="url" placeholder="https://..." value="\'+esc(p.diseno_link||\'\')+\'">\'
     +\'<label>Copy (caption para redes)</label><textarea id="e-copy">\'+esc(p.copy||\'\')+\'</textarea>\'
     +(p.hashtags!==undefined?\'<label>Hashtags</label><input id="e-hashtags" value="\'+esc(p.hashtags||\'\')+\'">\':\'\')
     +\'<label>Estado</label><select id="e-status">\'
@@ -3470,7 +3988,7 @@ function openPost(p){
 }
 
 function openNew(ds){
-  openPost({id:\'new-\'+Date.now(),brand:active!==\'all\'?active:\'EBDS\',date:ds,type:\'Post\',titulo:\'\',pilar:\'\',objetivo:\'\',texto_imagen:\'\',copy:\'\',hashtags:\'\',status:\'pendiente\',comments:\'\'});
+  openPost({id:\'new-\'+Date.now(),brand:active!==\'all\'?active:\'EBDS\',date:ds,type:\'Post\',titulo:\'\',pilar:\'\',objetivo:\'\',texto_imagen:\'\',diseno_prompt:\'\',diseno_link:\'\',copy:\'\',hashtags:\'\',status:\'pendiente\',comments:\'\'});
 }
 
 function updateModalHeader(){
@@ -3492,6 +4010,8 @@ async function savePost(){
     pilar:document.getElementById(\'e-pilar\').value,
     objetivo:document.getElementById(\'e-objetivo\').value,
     texto_imagen:document.getElementById(\'e-texto-imagen\').value,
+    diseno_prompt:document.getElementById(\'e-diseno-prompt\').value,
+    diseno_link:document.getElementById(\'e-diseno-link\').value,
     copy:document.getElementById(\'e-copy\').value,
     status:document.getElementById(\'e-status\').value,
     comments:document.getElementById(\'e-comments\').value
@@ -3502,7 +4022,7 @@ async function savePost(){
   if(btn){btn.disabled=true;btn.style.opacity=\'0.7\';btn.innerHTML=\'⏳ Guardando...\';}
   try{
     const ctrl=new AbortController();
-    const tid=setTimeout(()=>ctrl.abort(),25000);
+    const tid=setTimeout(()=>ctrl.abort(),45000);
     const r=await fetch(\'/calendar/save?key=\'+KEY,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({month:curMonth,post:p}),signal:ctrl.signal});
     clearTimeout(tid);
     if(r.ok){
@@ -4004,6 +4524,43 @@ def cron_check_posts():
         print(f'Check posts error: {e}')
     return Response('OK', status=200)
 
+@app.route('/media-proxy/<file_id>', methods=['GET'])
+def media_proxy(file_id):
+    """Sirve un archivo de WorkDrive públicamente (sin auth de Zoho) para que Meta pueda leerlo.
+    Protegido por un token compartido en el query string — no por seguridad fuerte, solo para
+    evitar que cualquiera lo use para gastar ancho de banda/quota de WorkDrive."""
+    if request.args.get('t') != MEDIA_PROXY_SECRET:
+        return Response('Forbidden', status=403)
+    try:
+        content, ctype = workdrive_download(file_id)
+        return Response(content, mimetype=ctype)
+    except Exception as e:
+        return Response(f'Error: {e}', status=500)
+
+@app.route('/cron/publish-scheduled', methods=['GET', 'POST'])
+def cron_publish_scheduled():
+    try:
+        publish_scheduled_posts()
+    except Exception as e:
+        print(f'Publish scheduled error: {e}')
+        _safe_tg_send(f'⚠️ Publicador: error general — {e}')
+    return Response('OK', status=200)
+
+@app.route('/debug/test-publish', methods=['GET'])
+def debug_test_publish():
+    """Prueba manual: publica UN post puntual sin depender del calendario ni del status 'aprobado'.
+    Uso: /debug/test-publish?brand=EBDS&date=2026-09-07&type=Post"""
+    brand = request.args.get('brand', 'EBDS')
+    date = request.args.get('date', '')
+    ptype = request.args.get('type', '')
+    if not date or not ptype:
+        return jsonify({'error': "Pasá ?date=YYYY-MM-DD&type=Post|Carrusel|Reel|Story"}), 400
+    try:
+        result = publish_post_to_meta(brand, {'date': date, 'type': ptype, 'copy': request.args.get('copy', '(prueba)'), 'hashtags': ''})
+        return jsonify({'ok': True, 'result': result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 @app.route('/calendar/generate', methods=['GET', 'POST'])
 def calendar_generate():
     """Procesa UNA marca pendiente del calendario por llamada. Llamar cada 2 min desde cron-job.org."""
@@ -4040,7 +4597,7 @@ def calendar_generate():
             year, mo = int(month_str[:4]), int(month_str[5:])
             posting_dates = get_posting_dates(year, mo)
             assignments   = assign_formats(brands, posting_dates)
-            calendar_data = read_calendar().get(month_str) or {}
+            calendar_data = get_calendar_data(month_str) or {}
 
             slots = [(d, brands_day[brand]) for d, brands_day in sorted(assignments.items()) if brand in brands_day]
             social   = generate_social_posts(brand, month_label, slots)
@@ -4186,8 +4743,8 @@ def calendar_brands_post():
     if name in cfg:
         return jsonify({'ok': False, 'error': f'La marca "{name}" ya existe'}), 409
 
-    # Crear tarea ClickUp para el calendario de esta marca
-    CALENDAR_LIST_ID = '901326439751'
+    # Crear tarea legacy para la marca (placeholder — el contenido real se guarda
+    # ya particionado por mes en cuanto se toque algún mes vía save_calendar_brand)
     try:
         res = cu_post(f'list/{CALENDAR_LIST_ID}/task', {
             'name': f'📅 Cal-{name} [NO BORRAR]',
@@ -4235,16 +4792,24 @@ def calendar_page():
     if not request.args.get('month'):
         from flask import redirect
         today = dt.date.today()
-        # Leer una vez por marca (5 llamadas) en lugar de buscar en el estado del bot
+        # El registro (marca,mes)->task_id ya dice qué meses tienen tarea propia,
+        # sin pegarle a ClickUp. Solo se hace el barrido legacy (más lento) para
+        # las marcas que todavía no tienen NINGÚN mes registrado — una vez que se
+        # tocó al menos un mes de cada marca desde este cambio, este bloque no
+        # vuelve a pedirle nada a ClickUp.
+        registry = _read_month_registry()
         months_with_data = set()
-        for brand in get_all_brand_tasks():
-            try:
-                brand_data = read_calendar_brand(brand)  # {month_str: [posts]}
-                for ms, posts in brand_data.items():
-                    if posts:
-                        months_with_data.add(ms)
-            except Exception:
-                pass
+        for brand_months in registry.values():
+            months_with_data.update(brand_months.keys())
+        brands_sin_registrar = [b for b in get_all_brand_tasks() if b not in registry]
+        if brands_sin_registrar:
+            with ThreadPoolExecutor(max_workers=min(8, len(brands_sin_registrar))) as ex:
+                futs = {ex.submit(_legacy_brand_months, b): b for b in brands_sin_registrar}
+                for fut in as_completed(futs):
+                    try:
+                        months_with_data.update(fut.result())
+                    except Exception:
+                        pass
         for delta in range(0, 7):
             d = today.replace(day=1) + dt.timedelta(days=32 * delta)
             ms = f'{d.year}-{str(d.month).zfill(2)}'
@@ -4258,11 +4823,34 @@ def calendar_data_route():
     if key != os.environ.get('CALENDAR_KEY', 'sofia2026mkt'):
         return Response('{}', status=401, mimetype='application/json')
     month_str = request.args.get('month', dt.date.today().strftime('%Y-%m'))
-    month_data = get_calendar_data(month_str)
-    brands = [b for b in get_all_brand_tasks() if b in month_data]
-    state = read_state()
+    brand_tasks = get_all_brand_tasks()  # cacheado — ya no se pide 2 veces por request
+    # Leer todas las marcas + el estado del bot (designer_checks) en paralelo,
+    # en vez de secuencial, para que cambiar de mes sea rápido.
+    with ThreadPoolExecutor(max_workers=len(brand_tasks) + 1) as ex:
+        f_state = ex.submit(read_state)
+        brand_futs = {ex.submit(read_calendar_brand, b, month_str): b for b in brand_tasks}
+        month_data = {}
+        failed_brands = []
+        for fut in as_completed(brand_futs):
+            b = brand_futs[fut]
+            try:
+                posts = fut.result()
+                if posts:
+                    month_data[b] = posts
+            except Exception as e:
+                # No confundir "falló la lectura" con "no hay posts este mes":
+                # se reporta aparte en 'errors' para que el frontend avise y
+                # reintente, en vez de mostrar (y cachear) el mes como vacío.
+                print(f'calendar_data_route {b}: {e}')
+                failed_brands.append(b)
+        try:
+            state = f_state.result()
+        except Exception as e:
+            print(f'calendar_data_route state: {e}')
+            state = {}
+    brands = [b for b in brand_tasks if b in month_data]
     designer_checks = state.get('designer_checks', [])
-    return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks}, ensure_ascii=False), mimetype='application/json')
+    return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks, 'errors': failed_brands}, ensure_ascii=False), mimetype='application/json')
 
 @app.route('/calendar/save', methods=['POST'])
 def calendar_save_route():
@@ -4278,20 +4866,24 @@ def calendar_save_route():
     brand = post.get('brand', '')
     if not brand:
         return Response('Bad request — falta brand en el post', status=400)
+    t0 = time.time()
     try:
-        # Leer y escribir SOLO la tarea de esa marca (payload ~15KB en lugar de 107KB)
-        brand_data = read_calendar_brand(brand)      # {month_str: [posts]}
-        posts_list = brand_data.get(month_str, [])
-        idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
-        if idx >= 0:
-            posts_list[idx] = post
-        else:
-            posts_list.append(post)
-        save_calendar_brand(brand, month_str, posts_list)
+        # 1 GET + 1 PUT a la tarea de (marca, mes) — ya no al calendario entero
+        # de la marca. Timings logueados para poder diagnosticar sin depender de
+        # que alguien inspeccione la red a mano.
+        def _apply(posts_list):
+            idx = next((i for i, p in enumerate(posts_list) if p.get('id') == post.get('id')), -1)
+            if idx >= 0:
+                posts_list[idx] = post
+            else:
+                posts_list.append(post)
+            return posts_list
+        _update_calendar_brand_month(brand, month_str, _apply)
     except Exception as e:
-        print(f'calendar_save_route error: {e}')
+        print(f'calendar_save_route error ({brand}/{month_str}, {time.time()-t0:.2f}s): {e}')
         return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
                         status=500, mimetype='application/json')
+    print(f'calendar_save_route OK {brand}/{month_str} en {time.time()-t0:.2f}s')
     return Response('OK', status=200)
 
 @app.route('/calendar/check-toggle', methods=['POST'])
@@ -4378,9 +4970,8 @@ def calendar_delete_route():
         return Response('Bad request', status=400)
     try:
         if brand:
-            posts_list = read_calendar_brand(brand, month_str)
-            posts_list = [p for p in posts_list if p.get('id') != post_id]
-            save_calendar_brand(brand, month_str, posts_list)
+            _update_calendar_brand_month(brand, month_str,
+                lambda posts_list: [p for p in posts_list if p.get('id') != post_id])
         else:
             # sin brand: buscar en todas las marcas
             for b in get_all_brand_tasks():
@@ -4430,12 +5021,17 @@ def calendar_regenerate_post_route():
         return Response('Bad request', status=400)
     # Buscar el post en las tareas de las marcas
     found_post = None; found_brand = None
-    for b in get_all_brand_tasks():
-        posts_list = read_calendar_brand(b, month_str)
-        for p in posts_list:
-            if p.get('id') == post_id:
-                found_post = p; found_brand = b; break
-        if found_post: break
+    try:
+        for b in get_all_brand_tasks():
+            posts_list = read_calendar_brand(b, month_str)
+            for p in posts_list:
+                if p.get('id') == post_id:
+                    found_post = p; found_brand = b; break
+            if found_post: break
+    except Exception as e:
+        print(f'calendar_regenerate_post_route search error: {e}')
+        return Response(json.dumps({'ok': False, 'error': str(e)[:200]}),
+                        status=500, mimetype='application/json')
     if not found_post:
         return Response('Post not found', status=404)
     try:
@@ -5427,3 +6023,4 @@ def paid_media_report_route():
 
     html = build_paid_media_html(client_name, meta_data, crm_data, month_date)
     return Response(html, mimetype='text/html')
+
