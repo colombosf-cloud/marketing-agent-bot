@@ -5,9 +5,9 @@ Esfuerzo: 🟢 bajo · 🟡 medio · 🔴 alto.
 
 | Sem | Grabar | Publicar largo | Video largo | Serie | Elenco | Shorts de la semana |
 |---|---|---|---|---|---|---|
-| 1 | mar 27/10 | **vie 30/10** | **Pizzas con caritas: armamos una pizza para cada uno de la familia** 🟢 | La Cocinita | Sofi + Chiari (+hermana) | (1) "La pizza-cara de papá" en 30 s · (2) Tendencia "Shaving cream prank" versión crema chantilly |
+| 1 | mar 27/10 | **vie 30/10** | **Desafío de dibujo: nos dibujamos con los ojos cerrados** 🟢 | Mamá vs Chiari | Sofi + Chiari (+papá jurado) | (1) La revelación de los dibujos · (2) "Chiari dibuja, mamá adivina" en 30 s |
 | 2 | dom 1/11 | vie 6/11 | **Mamá vs Chiari: ¿quién decora la mejor torta?** — papá jurado a ciegas 🟡 | Mamá vs Chiari | Sofi + Chiari + papá | (1) El veredicto de papá · (2) "¿Quién lo hizo mejor? Votá" |
-| 3 | dom 8/11 | vie 13/11 | **Chiari cocina SOLA: mamá solo puede hablar, no tocar** (panqueques) 🟢 | La Cocinita | Sofi + Chiari | (1) El momento del "vuelta y vuelta" · (2) Blooper |
+| 3 | dom 8/11 | vie 13/11 | **Pizzas con caritas: armamos una pizza para cada uno de la familia** 🟢 | La Cocinita | Sofi + Chiari (+hermana) | (1) "La pizza-cara de papá" en 30 s · (2) Tendencia "Shaving cream prank" versión crema chantilly |
 | 4 | dom 15/11 | vie 20/11 | **24 horas diciendo SÍ a todo lo que pide mi hija** 🟡 | Chiari Manda | Toda la familia | (1) "Lo más loco que pidió" · (2) Tendencia "Blink" con papá |
 | 5 | dom 22/11 | vie 27/11 | **Probamos recetas virales de TikTok: ¿funcionan o es mentira?** (3 recetas) 🟢 | La Cocinita | Sofi + Chiari | (1) La que falló · (2) La que funcionó en 30 s |
 | 6 | dom 29/11 | vie 4/12 | **Galletitas de Navidad decoradas (fáciles para hacer con niños)** 🟡 | Fechas | Sofi + Chiari + hermana | (1) Decorado en time-lapse · (2) "Hermana vs hermana: la galletita más fea" |
@@ -18,15 +18,15 @@ Esfuerzo: 🟢 bajo · 🟡 medio · 🔴 alto.
 | 11 | sáb 2/1 | **lun 4/1** | **Reyes Magos: pasto para los camellos + rosca casera** 🟡 | Fechas | Toda la familia | (1) Preparamos los zapatos · (2) Mañana del 6 (reacción, publicar el 6) |
 | 12 | dom 10/1 | vie 15/1 | **Helados caseros de verano con 2 ingredientes** 🟢 | La Cocinita | Sofi + Chiari + hermana | (1) Probamos sabores raros · (2) "How different our lives are" (hermanas) |
 | 13 | dom 17/1 | vie 22/1 | **Chiari elige TODO para su cumple de 7: planeamos la fiesta** (temática, menú, invitaciones caseras) 🟡 | Chiari Manda | Sofi + Chiari (+hermana) | (1) "¿Cuánto conoce mamá a Chiari? edición 7 años" · (2) Invitaciones DIY en 30 s |
-| 14 | 24/1 y fiesta | **vie 5/2** (después del cumple, sin decir la fecha) | **Hicimos la torta de cumpleaños de Chiari ¡7 años!** + momentos de la fiesta (sin invitados ajenos sin permiso de sus padres) 🔴 | Fechas | Toda la familia | (1) Soplar las velitas · (2) "De 6 a 7: lo que cambió" (emotivo) |
+| 14 | sáb 31/1 (fiesta) | **vie 5/2** (después del cumple, sin decir la fecha) | **Hicimos la torta de cumpleaños de Chiari ¡7 años!** + momentos de la fiesta (sin invitados ajenos sin permiso de sus padres) 🔴 | Fechas | Toda la familia | (1) Soplar las velitas · (2) "De 6 a 7: lo que cambió" (emotivo) |
 
 ## Fichas rápidas de los largos
 
-**S1 — Pizzas con caritas** · Prepizzas o masa fácil; cada pizza imita la cara de alguien de la familia (aceitunas = ojos, morrón = sonrisa, queso rallado = pelo). · Gancho: Chiari muestra la "pizza-papá" y papá reacciona. · Miniatura: Chiari sosteniendo su pizza-cara al lado de su propia cara, texto "¿SE PARECE?". · Giro: a mamá le sale la más fea. · Pregunta: "¿A quién se parece más su pizza? 👇"
+**S1 — Desafío de dibujo a ciegas** · Materiales: hojas grandes, marcadores gruesos, 2 antifaces, timer. · Rondas: (1) nos dibujamos una a la otra con ojos cerrados, 1 min; (2) dibujamos a papá sin mirar; (3) con la mano no hábil. Papá vota. · Gancho: los dibujos tapados + "uno de estos es horrible… ¿de quién?". · Miniatura: las dos con antifaz levantando los dibujos, "¿quién gana?". · Pregunta: "¿Qué dibujo ganó? Comentá 1 o 2".
 
 **S2 — Mamá vs Chiari torta** · Reglas: 30 min, mismos ingredientes, decoración libre. Papá prueba con ojos vendados. · Miniatura: las dos con sus tortas, cara competitiva, "¿QUIÉN GANA?". · Cliffhanger: anunciar la revancha.
 
-**S3 — Chiari cocina sola** · Regla: mamá con manos atrás (o atadas con el delantal). · Giro: panqueque al techo/piso. · Miniatura: Chiari con sartén, mamá desesperada atrás, "¡SOLA!". (Seguridad: la mamá maneja el fuego; Chiari lo hace con supervisión según su edad).
+**S3 — Pizzas con caritas** · Prepizzas; cada pizza imita la cara de alguien de la familia (aceitunas = ojos, morrón = sonrisa, queso = pelo). · Gancho: Chiari muestra la "pizza-papá" y papá reacciona. · Miniatura: Chiari con su pizza al lado de su cara, "¿se parece?". · Pregunta: "¿A quién se parece más su pizza?"
 
 **S4 — 24 h Sí a todo** · Pactar antes 3 límites (seguridad, plata, sueño). · Estructura por horario (desayuno → tarde → cena). · Miniatura: Chiari con corona y mamá con cara de "¿en qué me metí?", "24 H DE SÍ".
 
@@ -54,7 +54,7 @@ Esfuerzo: 🟢 bajo · 🟡 medio · 🔴 alto.
 1. "Lo que hay en la mochila de Chiari" (sin útiles con nombre/colegio). 2. Adiviná el sabor con ojos vendados. 3. Mamá copia todo lo que hace Chiari por 1 minuto. 4. Abecedario challenge. 5. Bloopers de la temporada.
 
 ## Video 2 por semana (opcional, si hay energía)
-Si alguna semana sale un segundo largo, priorizar: **Restaurante de Chiari** (roleplay, 🔴), **¿Cuánto conoce mamá a Chiari?** (🟢), **Slime en 3 ingredientes** (🟢), **Papá vs mamá: ¿quién cocina mejor según Chiari?** (🟡).
+Si alguna semana sale un segundo largo, priorizar: **Chiari cocina SOLA: mamá solo puede hablar** (🟢), **Restaurante de Chiari** (roleplay, 🔴), **¿Cuánto conoce mamá a Chiari?** (🟢), **Slime en 3 ingredientes** (🟢), **Papá vs mamá: ¿quién cocina mejor según Chiari?** (🟡).
 
 ## Revisión
 - Fin de semana 4 (22/11) y semana 8 (20/12): revisar métricas (`youtube-familia-viral/references/metricas.md`) y reemplazar los formatos más flojos por más entregas de la serie ganadora.

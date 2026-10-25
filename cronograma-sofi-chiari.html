@@ -1,0 +1,283 @@
+<title>Cronograma Sofi &amp; Chiari</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Patrick+Hand&family=Nunito:wght@400;600;700;800&display=swap">
+<style>
+/* Layout: cuaderno de planificación — columna única de semanas, fecha a la izquierda, ficha a la derecha; lunares pastel del logo en la cabecera. */
+:root{
+  --bg:#FDF6EC; --surface:#FFFDF9; --ink:#57483F; --ink-soft:#86766B; --accent:#B9848A; --line:#EADFD2;
+  --s-cocina:#F5DAC5; --s-vs:#EFCFD2; --s-manda:#DFD3E9; --s-fechas:#D9E4D3; --s-momentos:#F3ECE2;
+  --ok:#5E8A5A; --ok-bg:#E3EEDD; --warn:#A8743C;
+  --hand:"Patrick Hand","Comic Sans MS","Segoe Print",cursive;
+  --body:"Nunito",system-ui,-apple-system,"Segoe UI",sans-serif;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#221C19; --surface:#2C2420; --ink:#F2E7DA; --ink-soft:#B6A596; --accent:#D9A3A9; --line:#41362F;
+  --s-cocina:#5B4535; --s-vs:#5A3D43; --s-manda:#473F5A; --s-fechas:#3E4A3B; --s-momentos:#3A312B;
+  --ok:#A5D19E; --ok-bg:#2F3F2C; --warn:#E2AE74; color-scheme:dark }}
+:root[data-theme="dark"]{
+  --bg:#221C19; --surface:#2C2420; --ink:#F2E7DA; --ink-soft:#B6A596; --accent:#D9A3A9; --line:#41362F;
+  --s-cocina:#5B4535; --s-vs:#5A3D43; --s-manda:#473F5A; --s-fechas:#3E4A3B; --s-momentos:#3A312B;
+  --ok:#A5D19E; --ok-bg:#2F3F2C; --warn:#E2AE74; color-scheme:dark }
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.5;margin:0}
+.wrap{max-width:860px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:0 64px}
+header{position:relative;overflow:hidden;padding-block:36px 24px}
+.dot{position:absolute;border-radius:50%;filter:blur(1px);opacity:.85;z-index:0}
+.d1{width:170px;height:170px;background:var(--s-vs);top:-60px;left:-50px}
+.d2{width:120px;height:120px;background:var(--s-manda);top:10px;right:-30px}
+.d3{width:90px;height:90px;background:var(--s-cocina);bottom:-30px;left:38%}
+.d4{width:60px;height:60px;background:var(--s-fechas);top:40px;right:22%}
+.brand{position:relative;z-index:1;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.mono{width:64px;height:64px;border-radius:50%;border:1.5px solid var(--ink);box-shadow:inset 0 0 0 4px var(--bg),inset 0 0 0 5px var(--accent);display:grid;place-items:center;font-family:var(--hand);font-size:30px;background:var(--bg);flex:none}
+.mono b{font-weight:400}.mono i{font-style:normal;color:var(--accent);margin-left:-4px}
+h1{font-family:var(--hand);font-weight:400;font-size:40px;line-height:1;margin:0;text-wrap:balance}
+.sub{margin:4px 0 0;color:var(--ink-soft);font-size:14px}
+.summary{position:relative;z-index:1;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:22px}
+.sum{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:12px 14px;min-width:0}
+.sum small{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-soft);font-weight:700}
+.sum strong{display:block;font-size:15px;margin-top:2px;overflow-wrap:anywhere}
+.bar{height:6px;background:var(--line);border-radius:6px;margin-top:8px;overflow:hidden}.bar span{display:block;height:100%;background:var(--accent);width:0;transition:width .4s}
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-block:18px 8px}
+.chip{font:inherit;font-size:13px;font-weight:700;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:999px;padding:6px 12px;cursor:pointer}
+.chip[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.chip:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.status{margin-left:auto;font-size:12px;color:var(--ink-soft)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--ink-soft);margin-bottom:14px}
+.legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px;background:var(--c)}
+.month{font-family:var(--hand);font-size:26px;margin:26px 0 8px;color:var(--ink)}
+.ep{display:grid;grid-template-columns:78px 1fr;gap:14px;margin-bottom:14px}
+.date{text-align:center;padding-top:10px}
+.date .dw{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-soft);font-weight:700}
+.date .dd{font-family:var(--hand);font-size:38px;line-height:1}
+.date .dm{font-size:12px;color:var(--ink-soft)}
+.date .wk{display:inline-block;margin-top:6px;font-size:11px;font-weight:700;color:var(--ink-soft);border:1px dashed var(--line);border-radius:8px;padding:1px 6px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:14px 16px;min-width:0;position:relative}
+.card.next{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 25%,transparent)}
+.card.done{opacity:.78}
+.top{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.serie{font-size:12px;font-weight:800;border-radius:999px;padding:3px 10px;background:var(--c);color:var(--ink)}
+.tag{font-size:12px;color:var(--ink-soft)}
+.nextflag{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--accent)}
+.title{width:100%;font-family:var(--hand);font-size:24px;line-height:1.15;color:var(--ink);background:transparent;border:0;border-bottom:1px dashed transparent;padding:4px 0;margin:4px 0 2px;resize:none;overflow:hidden}
+.title:hover,.title:focus{border-bottom-color:var(--line);outline:none}
+.meta{font-size:13px;color:var(--ink-soft);display:flex;flex-wrap:wrap;gap:4px 14px}
+.checks{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.ck{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:700;border:1px solid var(--line);border-radius:10px;padding:5px 9px;cursor:pointer;user-select:none;background:var(--bg)}
+.ck input{appearance:none;width:16px;height:16px;border:1.5px solid var(--ink-soft);border-radius:5px;margin:0;display:grid;place-items:center;cursor:pointer;background:var(--surface)}
+.ck input:checked{background:var(--ok);border-color:var(--ok)}
+.ck input:checked::after{content:"";width:8px;height:4px;border:2px solid var(--surface);border-top:0;border-right:0;transform:rotate(-45deg) translate(1px,-1px)}
+.ck:has(input:checked){background:var(--ok-bg);border-color:transparent;color:var(--ok)}
+.pill{font-size:12px;font-weight:800;color:var(--ink-soft)}
+details{margin-top:10px;border-top:1px dashed var(--line);padding-top:8px}
+summary{cursor:pointer;font-weight:800;font-size:14px;list-style:none;display:flex;align-items:center;gap:6px;color:var(--ink)}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"›";display:inline-block;transition:transform .2s;font-size:18px;line-height:1}
+details[open] summary::before{transform:rotate(90deg)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-top:10px}
+.full{grid-column:1/-1}
+label.f{display:flex;flex-direction:column;gap:3px;font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-soft);min-width:0}
+label.f input,label.f textarea,label.f select{font:inherit;font-size:14px;letter-spacing:0;text-transform:none;font-weight:400;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:8px 10px;width:100%;min-width:0}
+label.f textarea{resize:vertical;min-height:64px;line-height:1.45}
+.shorts{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+.short{display:grid;grid-template-columns:auto 1fr 150px;gap:8px;align-items:center}
+.short input[type=text],.short input[type=date]{font:inherit;font-size:14px;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:7px 9px;width:100%;min-width:0}
+.short .ck{padding:4px 6px}
+.row-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
+.btn{font:inherit;font-weight:800;font-size:13px;border-radius:10px;padding:8px 14px;cursor:pointer;border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+.btn.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.btn.danger{color:var(--warn)}
+.empty{background:var(--surface);border:1px dashed var(--line);border-radius:18px;padding:28px;text-align:center;color:var(--ink-soft)}
+.empty h2{font-family:var(--hand);font-weight:400;font-size:26px;color:var(--ink);margin:0 0 6px}
+.foot{margin-top:28px;font-size:13px;color:var(--ink-soft);text-align:center}
+:disabled{cursor:not-allowed}
+@media (max-width:560px){
+  h1{font-size:32px}
+  .ep{grid-template-columns:1fr;gap:4px}
+  .date{display:flex;align-items:baseline;gap:8px;text-align:left;padding:0 4px}
+  .date .dd{font-size:26px}.date .wk{margin:0 0 0 auto}
+  .grid{grid-template-columns:1fr}
+  .short{grid-template-columns:auto 1fr}.short input[type=date]{grid-column:2}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <i class="dot d1"></i><i class="dot d2"></i><i class="dot d3"></i><i class="dot d4"></i>
+    <div class="brand">
+      <div class="mono" aria-hidden="true"><b>S</b><i>C</i></div>
+      <div>
+        <h1>sofi &amp; chiari</h1>
+        <p class="sub">Temporada 1 · un video largo los viernes + 2 Shorts (martes y jueves)</p>
+      </div>
+    </div>
+    <div class="summary" id="summary">
+      <div class="sum"><small>Próxima grabación</small><strong id="nextRec">—</strong></div>
+      <div class="sum"><small>Próxima publicación</small><strong id="nextPub">—</strong></div>
+      <div class="sum"><small>Videos publicados</small><strong id="progTxt">0 de 0</strong><div class="bar"><span id="progBar"></span></div></div>
+    </div>
+  </header>
+
+  <div class="toolbar" role="toolbar" aria-label="Filtros">
+    <button class="chip" data-f="todos" aria-pressed="true">Todos</button>
+    <button class="chip" data-f="pend" aria-pressed="false">Pendientes</button>
+    <button class="chip" data-f="hechos" aria-pressed="false">Publicados</button>
+    <span class="status" id="status" aria-live="polite">Conectando…</span>
+  </div>
+  <div class="legend">
+    <span style="--c:var(--s-cocina)">La Cocinita de Chiari</span>
+    <span style="--c:var(--s-vs)">Mamá vs Chiari</span>
+    <span style="--c:var(--s-manda)">Chiari Manda</span>
+    <span style="--c:var(--s-fechas)">Fechas especiales</span>
+    <span style="--c:var(--s-momentos)">Momentitos</span>
+  </div>
+
+  <main id="list">
+    <div class="empty" id="emptyState">
+      <h2>Cargando el cronograma…</h2>
+      <p>Acá aparecen las semanas con su fecha de grabación, publicación, guion y checks.</p>
+    </div>
+  </main>
+
+  <div class="row-actions" id="addRow" hidden>
+    <span class="tag">¿Surgió otra idea? Sumala como un video más.</span>
+    <button class="btn primary" id="addBtn">+ Agregar video</button>
+  </div>
+  <p class="foot">Los cambios se guardan solos. Esfuerzo: 🟢 fácil · 🟡 medio · 🔴 producción grande.</p>
+</div>
+
+<script>
+const SERIES={"La Cocinita":"--s-cocina","Mamá vs Chiari":"--s-vs","Chiari Manda":"--s-manda","Fechas":"--s-fechas","Momentitos":"--s-momentos"};
+const CHECKS=[["guion","Guion listo"],["materiales","Materiales"],["grabado","Grabado"],["editado","Editado"],["miniatura","Miniatura"],["publicado","Publicado"]];
+const DIAS=["dom","lun","mar","mié","jue","vie","sáb"],MESES=["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"];
+let db=null,col=null,canWrite=true,eps=[],filter="todos";
+const $=s=>document.querySelector(s);
+const parse=d=>{if(!d)return null;const [y,m,dd]=d.split("-").map(Number);return new Date(y,m-1,dd)};
+const fmt=d=>{const x=parse(d);return x?`${DIAS[x.getDay()]} ${x.getDate()} ${MESES[x.getMonth()].slice(0,3)}`:"sin fecha"};
+const today=()=>{const t=new Date();t.setHours(0,0,0,0);return t};
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function setStatus(t){$("#status").textContent=t}
+
+/* one write at a time per document */
+const queues={};
+function save(id,patch){
+  if(!col||!canWrite)return;
+  setStatus("Guardando…");
+  queues[id]=(queues[id]||Promise.resolve()).then(()=>col.doc(id).update(patch)).then(()=>setStatus("Guardado ✓")).catch(e=>{setStatus(e&&e.code==="not_granted"?"Solo lectura: no tenés permiso para editar":"No se pudo guardar. Revisá la conexión y probá de nuevo.")});
+}
+const timers={};
+function saveLater(id,key,patch){clearTimeout(timers[id+key]);timers[id+key]=setTimeout(()=>save(id,patch),700)}
+
+function nextUp(){
+  const t=today();
+  const rec=eps.filter(e=>!e.check?.grabado&&parse(e.grabar)&&parse(e.grabar)>=t).sort((a,b)=>a.grabar.localeCompare(b.grabar))[0]
+    ||eps.filter(e=>!e.check?.grabado).sort((a,b)=>(a.grabar||"").localeCompare(b.grabar||""))[0];
+  const pub=eps.filter(e=>!e.check?.publicado).sort((a,b)=>(a.publicar||"").localeCompare(b.publicar||""))[0];
+  return {rec,pub};
+}
+
+function render(){
+  const list=$("#list");
+  const {rec,pub}=nextUp();
+  const done=eps.filter(e=>e.check?.publicado).length;
+  $("#nextRec").textContent=rec?`${fmt(rec.grabar)} · ${rec.titulo}`:"Todo grabado 🎉";
+  $("#nextPub").textContent=pub?`${fmt(pub.publicar)} · ${pub.titulo}`:"Temporada completa 🎉";
+  $("#progTxt").textContent=`${done} de ${eps.length}`;
+  $("#progBar").style.width=eps.length?`${done/eps.length*100}%`:"0";
+  if(!eps.length){
+    list.innerHTML=`<div class="empty"><h2>Todavía no hay videos</h2><p>${canWrite?"Tocá “Agregar video” para sumar el primero.":"Cuando Sofi cargue el cronograma, aparece acá."}</p></div>`;
+    $("#addRow").hidden=!canWrite;return;
+  }
+  // keep open details across renders
+  const open=new Set([...document.querySelectorAll("details[open]")].map(d=>d.dataset.id));
+  const active=document.activeElement&&document.activeElement.dataset?document.activeElement.dataset.key+"|"+document.activeElement.closest("[data-ep]")?.dataset.ep:null;
+  let html="",lastMonth="";
+  const shown=eps.filter(e=>filter==="todos"||(filter==="pend"?!e.check?.publicado:e.check?.publicado));
+  for(const e of shown){
+    const d=parse(e.publicar);const m=d?`${MESES[d.getMonth()]} ${d.getFullYear()}`:"Sin fecha";
+    if(m!==lastMonth){html+=`<h2 class="month">${m.charAt(0).toUpperCase()+m.slice(1)}</h2>`;lastMonth=m}
+    const c=SERIES[e.serie]||"--s-momentos";
+    const isNext=pub&&pub.id===e.id;
+    const nChecks=CHECKS.filter(([k])=>e.check?.[k]).length;
+    const shorts=Object.entries(e.shorts||{}).sort((a,b)=>a[0].localeCompare(b[0]));
+    const dis=canWrite?"":"disabled";
+    html+=`<article class="ep" data-ep="${e.id}">
+      <div class="date"><div class="dw">${d?DIAS[d.getDay()]:""}</div><div class="dd">${d?d.getDate():"–"}</div><div class="dm">${d?MESES[d.getMonth()].slice(0,3):""}</div><span class="wk">sem ${esc(e.n)}</span></div>
+      <div class="card ${isNext?"next":""} ${e.check?.publicado?"done":""}">
+        <div class="top"><span class="serie" style="--c:var(${c})">${esc(e.serie)}</span><span class="tag">${esc(e.esfuerzo||"")}</span>${isNext?'<span class="nextflag">· lo que sigue</span>':""}<span class="pill" style="margin-left:auto">${nChecks}/${CHECKS.length}</span></div>
+        <textarea class="title" rows="1" data-key="titulo" aria-label="Título del video" ${dis}>${esc(e.titulo)}</textarea>
+        <div class="meta"><span>🎬 Grabar: ${fmt(e.grabar)}</span><span>📺 Publicar: ${fmt(e.publicar)}</span><span>👨‍👩‍👧 ${esc(e.elenco)}</span></div>
+        <div class="checks">${CHECKS.map(([k,l])=>`<label class="ck"><input type="checkbox" data-check="${k}" ${e.check?.[k]?"checked":""} ${dis}>${l}</label>`).join("")}</div>
+        <details data-id="${e.id}" ${open.has(e.id)?"open":""}>
+          <summary>Guion orientativo y detalles</summary>
+          <div class="grid">
+            <label class="f full">Gancho (primeros 5 segundos)<textarea data-key="gancho" rows="2" ${dis}>${esc(e.gancho)}</textarea></label>
+            <label class="f full">Paso a paso<textarea data-key="beats" rows="6" ${dis}>${esc(e.beats)}</textarea></label>
+            <label class="f full">Cierre y pregunta para comentarios<textarea data-key="cierre" rows="2" ${dis}>${esc(e.cierre)}</textarea></label>
+            <label class="f">Miniatura<textarea data-key="miniatura" rows="3" ${dis}>${esc(e.miniatura)}</textarea></label>
+            <label class="f">Materiales / compras<textarea data-key="materiales" rows="3" ${dis}>${esc(e.materiales)}</textarea></label>
+            <label class="f">Fecha de grabación<input type="date" data-key="grabar" value="${esc(e.grabar)}" ${dis}></label>
+            <label class="f">Fecha de publicación<input type="date" data-key="publicar" value="${esc(e.publicar)}" ${dis}></label>
+            <label class="f">Serie<select data-key="serie" ${dis}>${Object.keys(SERIES).map(s=>`<option ${s===e.serie?"selected":""}>${s}</option>`).join("")}</select></label>
+            <label class="f">Quiénes aparecen<input type="text" data-key="elenco" value="${esc(e.elenco)}" ${dis}></label>
+            <div class="full"><label class="f" style="margin-bottom:4px">Shorts de esta grabación</label>
+              <div class="shorts">${shorts.map(([sk,s])=>`<div class="short"><label class="ck" title="Publicado"><input type="checkbox" data-short="${sk}" data-sf="hecho" ${s.hecho?"checked":""} ${dis}></label><input type="text" data-short="${sk}" data-sf="texto" value="${esc(s.texto)}" aria-label="Idea del Short" ${dis}><input type="date" data-short="${sk}" data-sf="fecha" value="${esc(s.fecha)}" aria-label="Fecha del Short" ${dis}></div>`).join("")}</div>
+            </div>
+            <label class="f full">Notas (ocurrencias de Chiari, qué salió bien, qué cambiar)<textarea data-key="notas" rows="3" ${dis}>${esc(e.notas)}</textarea></label>
+          </div>
+          ${canWrite?`<div class="row-actions"><button class="btn" data-addshort>+ Short</button><span><button class="btn danger" data-del>Eliminar video</button><button class="btn danger" data-delok hidden>Sí, eliminar</button></span></div>`:""}
+        </details>
+      </div></article>`;
+  }
+  list.innerHTML=html||`<div class="empty"><h2>Nada por acá</h2><p>No hay videos con este filtro.</p></div>`;
+  list.querySelectorAll(".title").forEach(grow);
+  $("#addRow").hidden=!canWrite;
+  if(active){const [k,id]=active.split("|");const el=list.querySelector(`[data-ep="${id}"] [data-key="${k}"]`);if(el){el.focus();}}
+}
+function grow(t){t.style.height="auto";t.style.height=t.scrollHeight+"px"}
+
+function epOf(el){const a=el.closest("[data-ep]");return a&&eps.find(e=>e.id===a.dataset.ep)}
+document.addEventListener("input",ev=>{
+  const el=ev.target,e=epOf(el);if(!e)return;
+  if(el.classList.contains("title"))grow(el);
+  if(el.dataset.key&&el.type!=="date"&&el.tagName!=="SELECT"){e[el.dataset.key]=el.value;saveLater(e.id,el.dataset.key,{[el.dataset.key]:el.value})}
+  if(el.dataset.short&&el.dataset.sf==="texto"){e.shorts[el.dataset.short].texto=el.value;saveLater(e.id,"s"+el.dataset.short,{shorts:{[el.dataset.short]:{texto:el.value}}})}
+});
+document.addEventListener("change",ev=>{
+  const el=ev.target,e=epOf(el);if(!e)return;
+  if(el.dataset.check){e.check=e.check||{};e.check[el.dataset.check]=el.checked;save(e.id,{check:{[el.dataset.check]:el.checked}});render()}
+  else if(el.dataset.short&&el.dataset.sf!=="texto"){const v=el.type==="checkbox"?el.checked:el.value;e.shorts[el.dataset.short][el.dataset.sf]=v;save(e.id,{shorts:{[el.dataset.short]:{[el.dataset.sf]:v}}})}
+  else if(el.dataset.key&&(el.type==="date"||el.tagName==="SELECT")){e[el.dataset.key]=el.value;save(e.id,{[el.dataset.key]:el.value});sortEps();render()}
+});
+document.addEventListener("click",ev=>{
+  const b=ev.target.closest("button");if(!b)return;
+  if(b.dataset.f){filter=b.dataset.f;document.querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",c===b));render();return}
+  const e=epOf(b);
+  if(b.hasAttribute("data-addshort")&&e){const k="s"+(Object.keys(e.shorts||{}).length+1)+"_"+Date.now().toString(36);e.shorts=e.shorts||{};e.shorts[k]={texto:"",fecha:"",hecho:false};save(e.id,{shorts:{[k]:e.shorts[k]}});render();return}
+  if(b.hasAttribute("data-del")){b.hidden=true;b.nextElementSibling.hidden=false;return}
+  if(b.hasAttribute("data-delok")&&e){eps=eps.filter(x=>x!==e);render();col.doc(e.id).delete().then(()=>setStatus("Video eliminado")).catch(()=>setStatus("No se pudo eliminar"));return}
+});
+$("#addBtn").addEventListener("click",async()=>{
+  if(!col)return;
+  const n=eps.reduce((m,e)=>Math.max(m,Number(e.n)||0),0)+1;
+  const id="ep"+String(n).padStart(2,"0")+"_"+Date.now().toString(36);
+  const doc={n,titulo:"Nuevo video",serie:"Momentitos",esfuerzo:"🟢",elenco:"Sofi + Chiari",grabar:"",publicar:"",gancho:"",beats:"",cierre:"",miniatura:"",materiales:"",notas:"",check:{},shorts:{s1:{texto:"",fecha:"",hecho:false},s2:{texto:"",fecha:"",hecho:false}}};
+  setStatus("Guardando…");
+  try{await col.doc(id).set(doc);setStatus("Video agregado ✓")}catch(e){setStatus("No se pudo agregar el video")}
+});
+function sortEps(){eps.sort((a,b)=>(a.publicar||"9999").localeCompare(b.publicar||"9999")||(a.n-b.n))}
+
+(async()=>{
+  try{db=await claude.use("db")}catch(e){db=null}
+  if(!db){$("#emptyState").innerHTML="<h2>No se pudo abrir el cronograma</h2><p>Iniciá sesión en claude.ai para ver y editar las semanas.</p>";setStatus("Sin conexión");$("#addRow").hidden=true;return}
+  try{const user=await claude.use("user");const w=user?await user.can("data.write"):null;if(w===false)canWrite=false}catch(e){}
+  col=db.collection("episodios");
+  col.onSnapshot(snap=>{
+    const typing=document.activeElement&&(document.activeElement.tagName==="TEXTAREA"||document.activeElement.type==="text");
+    eps=snap.docs.map(d=>({id:d.id,...d.data()}));sortEps();
+    if(!typing)render(); else {const {pub}=nextUp();}
+    setStatus(canWrite?"Al día ✓":"Solo lectura");
+  },err=>setStatus("No se pudo leer el cronograma. Recargá la página."));
+})();
+</script>
