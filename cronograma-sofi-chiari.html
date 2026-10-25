@@ -113,7 +113,10 @@ label.f textarea{resize:vertical;min-height:64px;line-height:1.45}
 .sect{font-family:var(--hand);font-weight:400;font-size:30px;margin:30px 0 0}
 .flash{animation:flash 1.4s ease}
 @keyframes flash{0%,40%{box-shadow:0 0 0 4px var(--accent)}100%{box-shadow:none}}
-@media (max-width:560px){.day{min-height:64px;padding:3px}.ev{font-size:0;padding:0;height:8px;border-radius:4px}.ev.rec{height:6px}.calhead h2{font-size:22px}}
+.ev .et{display:block;font-size:10px;font-weight:800;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev .ef{display:block;font-weight:600}
+.ev.long .ef{font-weight:800}
+@media (max-width:560px){.day{min-height:64px;padding:2px;gap:2px}.ev{padding:2px 3px;border-radius:4px;-webkit-line-clamp:2}.ev .ef{display:none}.ev .et{font-size:9px;white-space:normal;line-height:1.15}.calhead h2{font-size:22px}}
 @media (max-width:560px){
   .logo{width:96px}.kicker{font-size:24px}
   .ep{grid-template-columns:1fr;gap:4px}
@@ -251,6 +254,7 @@ function render(){
             <label class="f">Materiales / compras<textarea data-key="materiales" rows="3" ${dis}>${esc(e.materiales)}</textarea></label>
             <label class="f">Fecha de grabación<input type="date" data-key="grabar" value="${esc(e.grabar)}" ${dis}></label>
             <label class="f">Fecha de publicación<input type="date" data-key="publicar" value="${esc(e.publicar)}" ${dis}></label>
+            <label class="f">Temática corta (se ve en el calendario)<input type="text" data-key="tema" maxlength="24" value="${esc(e.tema)}" ${dis}></label>
             <label class="f">Serie<select data-key="serie" ${dis}>${Object.keys(SERIES).map(s=>`<option ${s===e.serie?"selected":""}>${s}</option>`).join("")}</select></label>
             <label class="f">Quiénes aparecen<input type="text" data-key="elenco" value="${esc(e.elenco)}" ${dis}></label>
             <div class="full"><label class="f" style="margin-bottom:4px">Shorts de esta grabación</label>
@@ -274,16 +278,17 @@ function renderCal(){
   $("#calTitle").textContent=`${MESES[calM.getMonth()].charAt(0).toUpperCase()+MESES[calM.getMonth()].slice(1)} ${calM.getFullYear()}`;
   const byDay={};const add=(d,x)=>{if(d)(byDay[d]=byDay[d]||[]).push(x)};
   for(const e of eps){const c=SERIES[e.serie]||"--s-momentos";
-    add(e.grabar,{k:"rec",o:0,id:e.id,c,t:"🎬 Grabar: "+e.titulo,done:e.check?.grabado});
-    add(e.publicar,{k:"long",o:1,id:e.id,c,t:e.titulo,done:e.check?.publicado});
-    for(const s of Object.values(e.shorts||{}))add(s.fecha,{k:"short",o:2,id:e.id,c,t:"Short: "+(s.texto||"sin título"),done:s.hecho});}
+    const tema=e.tema||(e.titulo||"").split(/[:,(]/)[0].split(" ").slice(0,3).join(" ");
+    add(e.grabar,{k:"rec",o:0,id:e.id,c,tg:"🎬 "+tema,t:"Grabar: "+e.titulo,done:e.check?.grabado});
+    add(e.publicar,{k:"long",o:1,id:e.id,c,tg:"📺 "+tema,t:e.titulo,done:e.check?.publicado});
+    for(const s of Object.values(e.shorts||{}))add(s.fecha,{k:"short",o:2,id:e.id,c,tg:"▶ Short · "+tema,t:s.texto||"sin título",done:s.hecho});}
   const start=new Date(calM);start.setDate(1-((calM.getDay()+6)%7));
   const tIso=iso(today());
   let h=["lun","mar","mié","jue","vie","sáb","dom"].map(d=>`<div class="dow">${d}</div>`).join("");
   for(let i=0;i<42;i++){const d=new Date(start);d.setDate(start.getDate()+i);const k=iso(d);
     if(i===35&&d.getMonth()!==calM.getMonth())break;
     const items=(byDay[k]||[]).sort((a,b)=>a.o-b.o);
-    h+=`<div class="day ${d.getMonth()!==calM.getMonth()?"out":""} ${k===tIso?"today":""}"><span class="num">${d.getDate()}</span>${items.map(x=>`<button class="ev ${x.k} ${x.done?"is-done":""}" style="--c:var(${x.c})" data-go="${x.id}" title="${esc(x.t)}" aria-label="${esc(x.t)}">${esc(x.t)}</button>`).join("")}</div>`}
+    h+=`<div class="day ${d.getMonth()!==calM.getMonth()?"out":""} ${k===tIso?"today":""}"><span class="num">${d.getDate()}</span>${items.map(x=>`<button class="ev ${x.k} ${x.done?"is-done":""}" style="--c:var(${x.c})" data-go="${x.id}" title="${esc(x.t)}" aria-label="${esc(x.tg+": "+x.t)}"><span class="et">${esc(x.tg)}</span><span class="ef">${esc(x.t)}</span></button>`).join("")}</div>`}
   $("#calGrid").innerHTML=h;
 }
 $("#prevM").addEventListener("click",()=>{calM.setMonth(calM.getMonth()-1);renderCal()});
@@ -321,7 +326,7 @@ $("#addBtn").addEventListener("click",async()=>{
   if(!col)return;
   const n=eps.reduce((m,e)=>Math.max(m,Number(e.n)||0),0)+1;
   const id="ep"+String(n).padStart(2,"0")+"_"+Date.now().toString(36);
-  const doc={n,titulo:"Nuevo video",serie:"Momentitos",esfuerzo:"🟢",elenco:"Sofi + Chiari",grabar:"",publicar:"",gancho:"",beats:"",cierre:"",miniatura:"",materiales:"",notas:"",check:{},shorts:{s1:{texto:"",fecha:"",hecho:false},s2:{texto:"",fecha:"",hecho:false}}};
+  const doc={n,tema:"Nuevo",titulo:"Nuevo video",serie:"Momentitos",esfuerzo:"🟢",elenco:"Sofi + Chiari",grabar:"",publicar:"",gancho:"",beats:"",cierre:"",miniatura:"",materiales:"",notas:"",check:{},shorts:{s1:{texto:"",fecha:"",hecho:false},s2:{texto:"",fecha:"",hecho:false}}};
   setStatus("Guardando…");
   try{await col.doc(id).set(doc);setStatus("Video agregado ✓")}catch(e){setStatus("No se pudo agregar el video")}
 });
