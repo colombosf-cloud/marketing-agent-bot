@@ -49,7 +49,7 @@
 1. Hablarle a **familias (padres + chicos)**, no solo a chicos chicos → permite "No es para niños" (audiencia general) con comentarios y anuncios personalizados. Ver `seguridad-y-reglas.md`.
 2. Pilar central buscable (cocina fácil con chicos) + pilar de entretenimiento (desafíos/roles) + capa de tendencias en Shorts.
 3. La mamá aporta el humor para adultos; la nena aporta la autenticidad. Esa mezcla es la que el co-visionado premia.
-4. Calendario estacional argentino (Halloween, armado del arbolito 8-dic, fin de clases, Navidad, Año Nuevo, verano, Reyes, vuelta a clases) = picos de búsqueda gratis.
+4. Calendario estacional argentino (armado del arbolito 8-dic, fin de clases, Navidad, Año Nuevo, verano, Reyes, vuelta a clases) = picos de búsqueda gratis.
 
 ## Fuentes
 - https://gyre.pro/blog/top-trending-youtube-videos-and-channels-whos-leading-the-charts

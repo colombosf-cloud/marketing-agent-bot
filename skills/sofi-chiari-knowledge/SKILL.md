@@ -32,6 +32,13 @@ Regla: cada integrante decide si aparece. Si la hermana o Chiari dicen que no, s
 - Chiari no actúa un guion: se le explica el juego y se la deja ser.
 - Humor en textos en pantalla: "pensamientos de mamá" en burbujas.
 
+## 3b. Valores de la familia (reglas duras)
+- **Familia cristiana.** El contenido refleja sus valores: respeto, cariño, gratitud, compartir.
+- **No se hace Halloween**, ni ningún contenido con brujas, fantasmas, zombies, calaveras, sustos/terror, ocultismo o "magia oscura" — tampoco tendencias o audios con esa temática. No proponerlo nunca, ni como Short ni como tendencia.
+- Las fechas cristianas tienen su sentido: en Navidad, el pesebre y el nacimiento de Jesús (no solo Papá Noel y regalos); en Pascua, Jesús resucitado además de los huevos de chocolate; Reyes Magos con su historia.
+- La fe se vive con naturalidad, sin sermón: un momento tierno (Chiari explicando el pesebre, agradecer antes de comer) suma; el canal sigue siendo para todas las familias.
+- Lenguaje siempre limpio; nada de bromas de mal gusto.
+
 ## 4. Rituales de marca (repetir en todos los videos)
 - **Saludo** (después del gancho, ≤3 s): "¡Hola, familia! Somos Sofi… ¡y Chiari!" + choque de manos.
 - **Firma visual:** delantales iguales (mismo color en todos los videos de cocina). **[COMPLETAR color real]**
@@ -45,7 +52,7 @@ Regla: cada integrante decide si aparece. Si la hermana o Chiari dicen que no, s
 | **La Cocinita de Chiari** | Cocina (buscable) | 2 de cada 4 semanas | Recetas fáciles para hacer con chicos. Siempre con ingredientes en la descripción. |
 | **Mamá vs Chiari** | Competencia | 1 cada 2–3 semanas | Misma consigna, jurado a ciegas (papá/hermana), el público vota. |
 | **Chiari Manda** | Desafíos/roles | 1 por mes | 24 h de "sí a todo", roles invertidos, ella decide el día. |
-| **Fechas Sofi & Chiari** | Estacional | según calendario | Halloween, arbolito, Navidad, Reyes, verano, vuelta a clases… |
+| **Fechas Sofi & Chiari** | Estacional | según calendario | Arbolito y pesebre, Navidad, Año Nuevo, Reyes, verano, cumple de Chiari, vuelta a clases, Pascua, Día del Niño/Madre/Padre… |
 | **Momentitos** | Shorts / tendencias | 2–3 por semana | Tendencias adaptadas, bloopers, resultados en 30 s. |
 
 ## 6. Identidad visual (propuesta inicial — ajustar si ya hay logo)

@@ -38,7 +38,7 @@ Archivos de referencia (leer el que haga falta):
 
 ## 3. Flujo de trabajo cuando piden ideas o cronograma
 
-1. Leer skill de marca: personajes disponibles, series, fechas especiales, límites.
+1. Leer skill de marca: personajes disponibles, series, fechas especiales, límites y **valores/creencias de la familia** (qué fechas o temas no se hacen).
 2. Chequear tendencias de la semana (buscar en web: "trends TikTok/Shorts [mes año]", "trending audio family", y fechas del calendario local). Filtrar por seguridad y por si se puede "hacer propio".
 3. Proponer en mezcla 70/20/10:
    - **70% series probadas del canal** (lo que ya funcionó).
@@ -60,7 +60,7 @@ Archivos de referencia (leer el que haga falta):
 | Rutinas y "día en la vida" | Parasocial, mini vlog, tendencia Shorts | "Rutina de domingo de Sofi & Chiari" |
 | Pruebas de comida / taste test | Reacciones genuinas, barato | "Probamos dulces de otros países" |
 | Tendencias de TikTok/Shorts adaptadas | Alcance nuevo, rápido de producir | Audio/challenge de la semana |
-| Fechas especiales | Pico de búsqueda predecible | Halloween, Navidad, Reyes, vacaciones |
+| Fechas especiales | Pico de búsqueda predecible | Navidad, Reyes, cumpleaños, vacaciones (respetar valores/creencias de la familia) |
 | Sorpresas y regalos (con medida) | Emoción real | "Sorprendo a papá con su comida favorita" |
 | Educativo "escondido" | Padres lo eligen, YouTube Kids lo premia | "Ciencia en la cocina: volcán de bicarbonato" |
 

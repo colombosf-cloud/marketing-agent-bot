@@ -50,7 +50,7 @@ Elenco: M = mamá, H = hija protagonista, Hn = hermana, P = papá.
 36. 🟢 **Reaccionamos a nuestros videos/fotos de cuando era bebé** (sin datos sensibles).
 
 ## F. Fechas especiales (calendario Argentina)
-37. Halloween (31-oct): comida terrorífica, disfraz casero, "truco o trato" en casa.
+37. Halloween (31-oct): solo si la familia lo celebra — revisar siempre los valores en la skill de marca antes de proponerlo.
 38. 8-dic: armamos el arbolito; galletitas de Navidad.
 39. Fin de clases: "¿Qué aprendí este año?", regalo para la seño.
 40. Navidad/Año Nuevo: menú navideño hecho por la nena, pan dulce/budín.

@@ -6,7 +6,7 @@
 - Mezclar búsqueda + emoción: "Galletitas de Navidad fáciles con mi hija (salió un desastre)".
 - Evitar MAYÚSCULAS completas y emojis en exceso; 1 palabra en mayúsculas para énfasis está bien.
 - No repetir lo que dice la miniatura: se complementan.
-- Para fechas: el nombre de la fecha va al principio ("Halloween: …").
+- Para fechas: el nombre de la fecha va al principio ("Navidad: …").
 
 Ejemplos:
 - "Mi hija cocina SOLA por primera vez"
