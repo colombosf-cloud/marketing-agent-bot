@@ -55,12 +55,40 @@ Regla: cada integrante decide si aparece. Si la hermana o Chiari dicen que no, s
 | **Fechas Sofi & Chiari** | Estacional | según calendario | Arbolito y pesebre, Navidad, Año Nuevo, Reyes, verano, cumple de Chiari, vuelta a clases, Pascua, Día del Niño/Madre/Padre… |
 | **Momentitos** | Shorts / tendencias | 2–3 por semana | Tendencias adaptadas, bloopers, resultados en 30 s. |
 
-## 6. Identidad visual (propuesta inicial — ajustar si ya hay logo)
-- **Paleta:** Rosa chicle `#FF6F91` (principal) · Amarillo manteca `#FFD166` · Menta `#3DDC97` · Azul tinta `#26315A` (texto) · Crema `#FFF6EC` (fondos).
-- **Tipografías:** títulos *Fredoka* o *Baloo 2* (redondeadas, gruesas); texto *Nunito*.
-- **Miniaturas:** caras grandes a la izquierda, objeto protagonista a la derecha, 2–4 palabras en blanco con borde azul tinta, sello de serie en esquina superior. Fondo cocina desenfocado o color plano crema/rosa.
-- **Logo:** ya existe un logo pequeño (hecho con Claude Code). **[COMPLETAR: adjuntar archivo y colores exactos; si difieren de esta paleta, manda el logo]**
-- **Banner de canal:** foto de ambas con delantales + tagline + "Videos nuevos todos los [día]".
+## 6. Identidad visual (basada en el logo oficial)
+Logo: `assets/logo-vertical.jpg` — monograma manuscrito **"SC"** dentro de un círculo de doble línea (S en marrón café, C en rosa viejo) + debajo el nombre **"sofi & chiari"** en minúsculas, letra manuscrita. Fondo crema con lunares pastel grandes. Estética: suave, tierna, artesanal, "hecho a mano en casa".
+
+**Paleta (extraída del logo)**
+| Uso | Color | HEX |
+|---|---|---|
+| Fondo principal | Crema | `#FDF6EC` |
+| Texto, logo "S", contornos | Marrón café | `#57483F` |
+| Acento (logo "C", detalles, sellos) | Rosa viejo | `#B9848A` |
+| Lunar / fondo de serie | Rosa empolvado | `#EFCFD2` |
+| Lunar / fondo de serie | Lila | `#DFD3E9` |
+| Lunar / fondo de serie | Durazno | `#F5DAC5` |
+| Lunar / fondo de serie | Verde salvia | `#D9E4D3` |
+
+**Un color pastel por serie** (para que se reconozca en miniaturas y playlists): La Cocinita de Chiari = durazno · Mamá vs Chiari = rosa empolvado · Chiari Manda = lila · Fechas = verde salvia · Momentitos = crema con lunares.
+
+**Tipografías**
+- Nombre/marca: siempre el logo tal cual (no reescribirlo con otra letra).
+- Títulos en miniaturas y placas: manuscrita legible y gruesa tipo *Patrick Hand*, *Gochi Hand* o *Itim* (Google Fonts), en marrón café.
+- Texto corrido, subtítulos y descripciones de Shorts: *Nunito* (bold para subtítulos).
+- Siempre en minúsculas o tipo oración, como el logo (nada de todo en MAYÚSCULAS salvo 1 palabra de énfasis).
+
+**Miniaturas (adaptar la estética suave a algo que se vea en celular)**
+- Las caras y el plato van a color real y saturado; el pastel queda en el fondo/placas. Si todo es pastel, la miniatura se pierde en el feed.
+- Texto de 2–4 palabras en marrón café grueso con borde blanco o sobre una "pastilla" crema.
+- Lunar pastel de la serie detrás de las caras + monograma SC chico en una esquina superior (nunca abajo a la derecha).
+- Mismo layout por serie.
+
+**Video**
+- Intro (≤2 s, después del gancho): lunares pastel que aparecen + monograma SC + "sofi & chiari".
+- Placas/textos en pantalla: pastilla crema con borde rosa viejo y texto marrón café.
+- Sello "Aprobado por Chiari": círculo de doble línea como el logo, en rosa viejo.
+- Pantalla final: fondo crema con lunares, logo al centro, 2 videos sugeridos.
+- Banner del canal: fondo crema con lunares, logo + foto de las dos con delantales + "videos nuevos todos los viernes".
 
 ## 7. Calendario de publicación
 - **Video largo:** 1 por semana, **viernes 18:00 (hora Argentina)** — fin de semana = momento de ver en familia y de planear qué cocinar.
