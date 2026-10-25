@@ -72,7 +72,7 @@ Logo: `assets/logo-vertical.jpg` — monograma manuscrito **"SC"** dentro de un 
 **Un color pastel por serie** (para que se reconozca en miniaturas y playlists): La Cocinita de Chiari = durazno · Mamá vs Chiari = rosa empolvado · Chiari Manda = lila · Fechas = verde salvia · Momentitos = crema con lunares.
 
 **Tipografías**
-- Nombre/marca: siempre el logo tal cual (no reescribirlo con otra letra).
+- Nombre/marca: **siempre el logo original** (`assets/logo.jpg` recortado, o `assets/logo-vertical.jpg` completo). Nunca recrearlo con tipografías ni separar el monograma: la "S" y la "C" van entrelazadas, son una sola pieza. En fondos oscuros, apoyarlo sobre una placa crema `#FDF6EC`.
 - Títulos en miniaturas y placas: manuscrita legible y gruesa tipo *Patrick Hand*, *Gochi Hand* o *Itim* (Google Fonts), en marrón café.
 - Texto corrido, subtítulos y descripciones de Shorts: *Nunito* (bold para subtítulos).
 - Siempre en minúsculas o tipo oración, como el logo (nada de todo en MAYÚSCULAS salvo 1 palabra de énfasis).
