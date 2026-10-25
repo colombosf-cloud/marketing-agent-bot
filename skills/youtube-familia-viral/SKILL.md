@@ -92,7 +92,12 @@ Archivos de referencia (leer el que haga falta):
 
 ## 8. Producción en casa (kit mínimo)
 
-- Celular en 4K/30 o 1080/60, horizontal para largos y vertical para Shorts (o grabar 4K horizontal y recortar). Dos celulares: uno plano general fijo, otro en mano para detalles.
+- **¿Horizontal o vertical?** Los dos, según la pieza:
+  - Video largo → **horizontal 16:9** siempre (se ve en TV y compu, donde mira la familia junta; vertical en largo rinde peor).
+  - Shorts/tendencias → **vertical 9:16 nativo**.
+  - Ideal: **2 celulares** — principal horizontal 4K en trípode (plano general) + secundario vertical en plano corto (caras, manos, reacciones) = Shorts listos sin recortar.
+  - Con 1 solo celular: grabar horizontal 4K con las personas cerca del centro (permite recortar a vertical 1080×1920 con calidad) y dedicar 10 min al final a grabar en vertical los Shorts/tendencias del día.
+- Celular en 4K/30 (o 1080/60). Activar estabilización, bloquear exposición y foco tocando la cara.
 - Micrófono corbatero inalámbrico doble (la mejora con más impacto). Bajar ruido de extractor y TV.
 - Luz: de frente a una ventana o un aro de luz/softbox detrás de cámara. Cocina = luz cenital dura: sumar luz frontal.
 - Cenital/top-shot para cocina y manualidades (soporte de brazo).

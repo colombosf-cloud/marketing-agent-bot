@@ -1,4 +1,4 @@
-# Cronograma Sofi & Chiari — Temporada 1 (26-oct-2026 → 17-ene-2027)
+# Cronograma Sofi & Chiari — Temporada 1 (26-oct-2026 → 7-feb-2027)
 
 **Ritmo:** 1 video largo por semana (viernes 18 h) + 2 Shorts (martes y jueves 19 h) sacados de la misma grabación. Si una semana no se puede grabar, se publican solo los Shorts de reserva (ver al final).
 Esfuerzo: 🟢 bajo · 🟡 medio · 🔴 alto.
@@ -17,6 +17,8 @@ Esfuerzo: 🟢 bajo · 🟡 medio · 🔴 alto.
 | 10 | dom 27/12 | **mié 30/12** | **Cápsula del tiempo 2027: lo que aprendimos este año** (se abre en 2027 → serie futura) 🟢 | Momentitos | Sofi + Chiari | (1) "Mi deseo para 2027" · (2) Mejores momentos de la temporada |
 | 11 | sáb 2/1 | **lun 4/1** | **Reyes Magos: pasto para los camellos + rosca casera** 🟡 | Fechas | Toda la familia | (1) Preparamos los zapatos · (2) Mañana del 6 (reacción, publicar el 6) |
 | 12 | dom 10/1 | vie 15/1 | **Helados caseros de verano con 2 ingredientes** 🟢 | La Cocinita | Sofi + Chiari + hermana | (1) Probamos sabores raros · (2) "How different our lives are" (hermanas) |
+| 13 | dom 17/1 | vie 22/1 | **Chiari elige TODO para su cumple de 7: planeamos la fiesta** (temática, menú, invitaciones caseras) 🟡 | Chiari Manda | Sofi + Chiari (+hermana) | (1) "¿Cuánto conoce mamá a Chiari? edición 7 años" · (2) Invitaciones DIY en 30 s |
+| 14 | 24/1 y fiesta | **vie 5/2** (después del cumple, sin decir la fecha) | **Hicimos la torta de cumpleaños de Chiari ¡7 años!** + momentos de la fiesta (sin invitados ajenos sin permiso de sus padres) 🔴 | Fechas | Toda la familia | (1) Soplar las velitas · (2) "De 6 a 7: lo que cambió" (emotivo) |
 
 ## Fichas rápidas de los largos
 
@@ -43,6 +45,10 @@ Esfuerzo: 🟢 bajo · 🟡 medio · 🔴 alto.
 **S11 — Reyes** · Tradición fuerte en LatAm. El Short del 6-ene con la reacción.
 
 **S12 — Helados** · Pilar de verano: se puede convertir en mini-serie ("Verano en la Cocinita").
+
+**S13 — Planeamos el cumple** · Chiari decide temática, menú y decoración; mamá con presupuesto. Gancho con su ocurrencia más loca para la fiesta.
+
+**S14 — Torta de cumple 7** · Publicar unos días después del cumple y no decir la fecha exacta (privacidad). Amigos/as del cumple solo con permiso de sus familias; si no, desenfocar o no mostrar.
 
 ## Shorts de reserva (para semanas sin grabación)
 1. "Lo que hay en la mochila de Chiari" (sin útiles con nombre/colegio). 2. Adiviná el sabor con ojos vendados. 3. Mamá copia todo lo que hace Chiari por 1 minuto. 4. Abecedario challenge. 5. Bloopers de la temporada.
