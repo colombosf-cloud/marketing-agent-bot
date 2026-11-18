@@ -4848,7 +4848,10 @@ def calendar_data_route():
         except Exception as e:
             print(f'calendar_data_route state: {e}')
             state = {}
-    brands = [b for b in brand_tasks if b in month_data]
+    # Todas las marcas configuradas aparecen siempre como pestaña, aunque el mes
+    # todavía no tenga posts — así un mes vacío (ej. uno que el agente va a
+    # llenar) muestra las marcas listas para cargar contenido.
+    brands = list(brand_tasks)
     designer_checks = state.get('designer_checks', [])
     return Response(json.dumps({'posts': month_data, 'brands': brands, 'designer_checks': designer_checks, 'errors': failed_brands}, ensure_ascii=False), mimetype='application/json')
 
